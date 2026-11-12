@@ -47,6 +47,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -410,6 +411,7 @@ public class ITUdsVeneerBenchmark {
 
     if (!TIMELINE_RECORDS.isEmpty()) {
       try {
+        String timelineFile = System.getProperty("gcs.bench.timeline.file", "/tmp/benchmark_timeline.json");
         StringBuilder sb = new StringBuilder("[\n");
         for (int i = 0; i < TIMELINE_RECORDS.size(); i++) {
           sb.append("  ").append(TIMELINE_RECORDS.get(i));
@@ -417,8 +419,8 @@ public class ITUdsVeneerBenchmark {
           sb.append("\n");
         }
         sb.append("]\n");
-        Files.write(Paths.get("/tmp/benchmark_timeline.json"), sb.toString().getBytes(StandardCharsets.UTF_8));
-        log("Saved benchmark timeline to /tmp/benchmark_timeline.json (" + TIMELINE_RECORDS.size() + " entries)");
+        Files.write(Paths.get(timelineFile), sb.toString().getBytes(StandardCharsets.UTF_8));
+        log("Saved benchmark timeline to " + timelineFile + " (" + TIMELINE_RECORDS.size() + " entries)");
       } catch (Exception e) {
         log("Warning: Failed to write timeline: " + e.getMessage());
       }
@@ -445,6 +447,15 @@ public class ITUdsVeneerBenchmark {
     System.clearProperty("gcs.sidecar.default.transport");
     System.clearProperty("gcs.sidecar.transport");
     log("Cleanup complete.");
+  }
+
+  @After
+  public void tearDownTestMethod() throws Exception {
+    int pauseSec = Integer.getInteger("gcs.bench.pause.sec", 0);
+    if (pauseSec > 0) {
+      log(String.format("Quiescing for %d seconds to isolate Cloud Monitoring telemetry...", pauseSec));
+      Thread.sleep(pauseSec * 1000L);
+    }
   }
 
   // =========================================================================
@@ -1005,8 +1016,8 @@ public class ITUdsVeneerBenchmark {
   // =========================================================================
 
   @Test
-  public void test09_List100ItemsBenchmark() throws Exception {
-    banner("TEST 09: ListObjects & ListBuckets Benchmark (100 Items)");
+  public void test09a_ListObjects100Benchmark() throws Exception {
+    banner("WORKLOAD 7a: ListObjects (100 Items)");
     int listIters = Integer.getInteger("gcs.bench.list.iterations", IS_LIVE ? 20 : 2);
     log(String.format("Executing %d listing iterations against 100 items in bucket: %s", listIters, TEST_BUCKET));
 
@@ -1047,8 +1058,17 @@ public class ITUdsVeneerBenchmark {
         getUsedHeapMb()
     );
     recordedMetrics.add(metric);
+  }
 
-    // Part B: ListBuckets (project-scoped)
+  public void test09_List100ItemsBenchmark() throws Exception {
+    test09a_ListObjects100Benchmark();
+    test09b_ListBucketsBenchmark();
+  }
+
+  @Test
+  public void test09b_ListBucketsBenchmark() throws Exception {
+    banner("WORKLOAD 7b: ListBuckets (Project-scoped)");
+    int listIters = Integer.getInteger("gcs.bench.list.iterations", IS_LIVE ? 20 : 2);
     log(String.format("Executing %d ListBuckets iterations (project-scoped)...", listIters));
     Instant bktStart = Instant.now();
     List<Double> bucketLatencies = new ArrayList<>();
