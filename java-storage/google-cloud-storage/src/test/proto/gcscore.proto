@@ -25,7 +25,6 @@ option java_multiple_files = true;
 option java_package = "gcscore.v1";
 option java_outer_classname = "GcsCoreProto";
 
-
 service GcsCore {
   // Round-trip health check and latency/throughput microbenchmark; echoes `payload`.
   rpc Ping(PingRequest) returns (PingResponse);
@@ -44,9 +43,18 @@ service GcsCore {
   // The first message on the stream must carry `header`.
   rpc WriteObject(stream WriteRequest) returns (WriteObjectResponse);
 
+  // Bidirectional appendable upload session (BidiWriteObject over gRPC) supporting
+  // incremental GCS-acknowledged `flush`, takeover by `generation`, and close-time
+  // `finalize` vs `closeWithoutFinalizing` semantics.
+  rpc AppendObject(stream AppendRequest) returns (stream AppendResponse);
+
   // Single-page control-plane listing (mirrors language SDK iterators / PageInfo).
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
+
+  // Control-plane single-object metadata lookup and deletion.
+  rpc GetObject(GetObjectRequest) returns (ListedObject);
+  rpc DeleteObject(DeleteObjectRequest) returns (Empty);
 
   // Linux shared-memory zero-copy read data plane: the client obtains a sealed
   // memfd over the companion `<socket>.shm` SCM_RIGHTS channel and mmaps it;
@@ -124,6 +132,7 @@ message OpenObjectRequest {
   string bucket = 1;
   string object = 2;
   int64 generation = 3;
+  optional int64 if_generation_match = 4;  // Unset or < 0 = no precondition; 0 = DoesNotExist
 }
 
 message OpenObjectResponse {
@@ -148,13 +157,39 @@ message WriteHeader {
   optional int64 known_size = 5;           // >= 0 enables single-shot upload on JSON path
   uint32 chunk_size = 6;                   // Resumable upload flush size; 0 = default
   Transport transport = 7;
+  bool appendable = 8;                     // Requires gRPC BidiWriteObject appendable semantics (no JSON fallback)
+  optional bool finalize_on_close = 9;     // Unset or true = finalize(); false = close() without finalizing
+  optional int64 generation = 10;          // > 0 reopens an existing unfinalized appendable object for takeover
+}
+
+message WriteFinish {
+  bool finalize = 1;                  // true = finalize(); false = close() without finalizing
+  optional uint32 expected_crc32c = 2;
 }
 
 message WriteRequest {
   oneof msg {
     WriteHeader header = 1;
     bytes data = 2;
+    WriteFinish finish = 3;
   }
+}
+
+message AppendRequest {
+  oneof msg {
+    WriteHeader header = 1;
+    bytes data = 2;
+    Empty flush = 3;
+    WriteFinish finish = 4;
+  }
+}
+
+message AppendResponse {
+  int64 persisted_size = 1;
+  int64 generation = 2;
+  uint32 crc32c = 3;
+  bool finalized = 4;
+  ObjectMeta meta = 5;
 }
 
 message WriteObjectResponse {
@@ -184,6 +219,8 @@ message ListedObject {
   string storage_class = 6;
   int64 updated_unix_secs = 7;
   uint32 crc32c = 8;
+  string content_encoding = 9;
+  string etag = 10;
 }
 
 message ListObjectsResponse {
@@ -210,6 +247,20 @@ message ListedBucket {
 message ListBucketsResponse {
   repeated ListedBucket items = 1;
   string next_page_token = 2;
+}
+
+message GetObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  optional int64 if_generation_match = 4;
+}
+
+message DeleteObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  optional int64 if_generation_match = 4;
 }
 
 message CreateSessionRequest {

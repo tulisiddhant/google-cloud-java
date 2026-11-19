@@ -1,46 +1,63 @@
+/*
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.google.cloud.storage.sidecar;
 
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
 import com.google.api.gax.paging.Page;
 import com.google.cloud.NoCredentials;
 import com.google.cloud.ReadChannel;
 import com.google.cloud.WriteChannel;
 import com.google.cloud.storage.Blob;
+import com.google.cloud.storage.BlobAppendableUpload;
+import com.google.cloud.storage.BlobAppendableUpload.AppendableUploadWriteableByteChannel;
+import com.google.cloud.storage.BlobAppendableUploadConfig;
+import com.google.cloud.storage.BlobAppendableUploadConfig.CloseAction;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
-import com.google.cloud.storage.Bucket;
-import com.google.cloud.storage.Storage;
-import com.google.api.core.ApiFuture;
 import com.google.cloud.storage.BlobReadSession;
+import com.google.cloud.storage.Bucket;
+import com.google.cloud.storage.GrpcStorageOptions;
 import com.google.cloud.storage.RangeSpec;
 import com.google.cloud.storage.ReadProjectionConfigs;
-
+import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.Storage.BlobListOption;
+import com.google.cloud.storage.Storage.BucketListOption;
 import com.google.cloud.storage.StorageOptions;
-import com.google.cloud.storage.GrpcStorageOptions;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpHandler;
-import com.sun.net.httpserver.HttpServer;
+import com.google.cloud.storage.sidecar.UdsStorage.DriverMode;
 import gcscore.v1.StatsResponse;
-import io.grpc.ManagedChannel;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.File;
+import gcscore.v1.Transport;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Queue;
 import java.util.Random;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -56,17 +73,13 @@ import org.junit.Test;
 import org.junit.runners.MethodSorters;
 
 /**
- * High-level Veneer Integration Benchmark for GCS SDK Consolidation (Java over UDS).
- * Evaluates performance and process telemetry for the PR #7350 Rust sidecar (gcs-core-server).
+ * Remediation-compliant Veneer Integration Benchmark for GCS SDK Consolidation (Java over UDS).
  *
- * Benchmark Suite:
- * 1. Section 0: UDS gRPC IPC Ping Round-Trip Microbenchmark (1 B, 1 KiB, 64 KiB, 1 MiB).
- * 2. Section 1: Functional validation of veneer methods (create, createFrom, reader, writer, downloadTo, list, delete).
- * 3. Section 2: W1R3 (Write 1, Read 3) across 1 KiB, 100 KiB, 16 MiB, and 200 MiB payloads.
- * 4. Section 3: Concurrent thread scaling (1, 2, 4, 8 workers).
- * 5. Section 4: ListObjects and ListBuckets for 100 items.
- * 6. Section 5: Process Telemetry (Sidecar CPU user/sys time, VmRSS, VmHWM, thread count, RPC count).
- * 7. Section 6: Cloudpath Rapid Workloads (48 parallel workers, Workload 4 Read 16MB/200MB, Workload 5 Write 200MB).
+ * <p>Evaluates {@code Native Java}, {@code uds-sidecar} ({@code DRIVER=uds}), and {@code
+ * uds-inproc} ({@code DRIVER=uds-inproc}) across both {@code gRPC} and {@code JSON} transports with
+ * strict 1:1 Veneer API symmetry, steady-state warmup, dual {@code MB/s} + {@code MiB/s} reporting,
+ * {@code >= 120s} Cloud Monitoring sampling windows, and per-workload JVM + Rust {@code Stats}
+ * CPU/{@code VmHWM} deltas.
  */
 @FixMethodOrder(MethodSorters.NAME_ASCENDING)
 public class ITUdsVeneerBenchmark {
@@ -74,26 +87,32 @@ public class ITUdsVeneerBenchmark {
   private static final String TEST_BUCKET =
       System.getProperty("gcs.test.bucket", "sidecar-experiment-bucket");
   private static final String DRIVER =
-      System.getProperty("gcs.benchmark.driver", System.getProperty("gcs.driver", "uds")); // "uds" or "native"
+      System.getProperty("gcs.benchmark.driver", System.getProperty("gcs.driver", "uds"));
   private static final boolean IS_LIVE =
-      Boolean.parseBoolean(System.getProperty("gcs.live.benchmark", System.getProperty("gcs.bench.live", "false")));
+      Boolean.parseBoolean(
+          System.getProperty("gcs.live.benchmark", System.getProperty("gcs.bench.live", "false")));
+  private static final int MIN_WINDOW_SEC =
+      Integer.getInteger("gcs.bench.min.window.sec", IS_LIVE ? 120 : 0);
+  private static final boolean ENABLE_WARMUP =
+      Boolean.parseBoolean(System.getProperty("gcs.bench.warmup", "true"));
 
-  private static final ConcurrentHashMap<String, Long> OBJECT_SIZES = new ConcurrentHashMap<>();
-
-  private static HttpServer mockBackend;
-  private static RustSidecarProcessManager processManager;
-  private static ManagedChannel channel;
+  private static MockStorageGrpcServer mockServer;
   private static Storage storage;
+  private static final List<Storage> nativeClientPool = new ArrayList<Storage>();
   private static UdsStorage udsStorageHandler;
+  private static String activeTransport = "grpc";
 
-  private static final List<BenchmarkMetric> recordedMetrics = new ArrayList<>();
-  private static final List<String> TIMELINE_RECORDS = Collections.synchronizedList(new ArrayList<>());
+  private static final List<BenchmarkMetric> recordedMetrics = new ArrayList<BenchmarkMetric>();
+  private static final List<String> TIMELINE_RECORDS =
+      Collections.synchronizedList(new ArrayList<String>());
   private static StatsResponse initialStats;
   private static StatsResponse finalStats;
 
   private static void recordTimeline(String workload, Instant start, Instant end) {
-    TIMELINE_RECORDS.add(String.format("{\"workload\":\"%s\",\"start\":\"%s\",\"end\":\"%s\"}",
-        workload, start.toString(), end.toString()));
+    TIMELINE_RECORDS.add(
+        String.format(
+            "{\"workload\":\"%s\",\"driver\":\"%s\",\"transport\":\"%s\",\"start\":\"%s\",\"end\":\"%s\"}",
+            workload, DRIVER, activeTransport, start.toString(), end.toString()));
   }
 
   private static String repeat(String s, int count) {
@@ -105,9 +124,9 @@ public class ITUdsVeneerBenchmark {
   }
 
   private static void banner(String title) {
-    System.out.println("\n" + repeat("=", 80));
+    System.out.println("\n" + repeat("=", 88));
     System.out.println("  " + title);
-    System.out.println(repeat("=", 80));
+    System.out.println(repeat("=", 88));
   }
 
   private static void log(String msg) {
@@ -115,290 +134,171 @@ public class ITUdsVeneerBenchmark {
   }
 
   private static String getTransportPrefix() {
+    String tag = activeTransport.toUpperCase();
     if ("native".equalsIgnoreCase(DRIVER)) {
-      String t = System.getProperty("gcs.native.transport", IS_LIVE ? "grpc" : "json");
-      return "[Native-" + t.toUpperCase() + "] ";
+      return "[Native-" + tag + "] ";
+    } else if ("uds-inproc".equalsIgnoreCase(DRIVER)) {
+      return "[UDS-INPROC-" + tag + "] ";
     } else {
-      String t = System.getProperty("gcs.sidecar.default.transport", "grpc");
-      return "[UDS-" + t.toUpperCase() + "] ";
+      return "[UDS-SIDECAR-" + tag + "] ";
     }
+  }
+
+  private static boolean isGrpcTransport() {
+    return "grpc".equalsIgnoreCase(activeTransport);
+  }
+
+  private static Storage pickClient(int workerIndex) {
+    if ("native".equalsIgnoreCase(DRIVER) && !nativeClientPool.isEmpty()) {
+      return nativeClientPool.get(Math.abs(workerIndex) % nativeClientPool.size());
+    }
+    return storage;
   }
 
   @BeforeClass
   public static void setUp() throws Exception {
-    banner(String.format("GCS BENCHMARK SETUP: DRIVER=%s | LIVE=%b | BUCKET=%s",
-        DRIVER.toUpperCase(), IS_LIVE, TEST_BUCKET));
+    String requestedTransport;
+    if ("native".equalsIgnoreCase(DRIVER)) {
+      requestedTransport = System.getProperty("gcs.native.transport", "grpc");
+    } else {
+      requestedTransport =
+          System.getProperty(
+              "gcs.sidecar.transport",
+              System.getProperty("gcs.sidecar.default.transport", "grpc"));
+    }
+    activeTransport = "json".equalsIgnoreCase(requestedTransport) ? "json" : "grpc";
 
-    // 1. Start embedded high-throughput mock GCS backend if not using live endpoint
+    banner(
+        String.format(
+            "GCS BENCHMARK SETUP: DRIVER=%s | TRANSPORT=%s | LIVE=%b | BUCKET=%s | MIN_WIN=%ds",
+            DRIVER.toUpperCase(),
+            activeTransport.toUpperCase(),
+            IS_LIVE,
+            TEST_BUCKET,
+            MIN_WINDOW_SEC));
+
     if (!IS_LIVE) {
       String customEndpoint = System.getProperty("gcs.sidecar.endpoint");
       if (customEndpoint == null || customEndpoint.isEmpty()) {
-        mockBackend = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        mockBackend.setExecutor(Executors.newCachedThreadPool());
+        mockServer = new MockStorageGrpcServer();
+        mockServer.start();
+        seedMockFixtures(mockServer);
 
-        // Pre-populate mock object sizes for 48 parallel workers (bench-200mb-*.bin)
-        for (int i = 0; i < 48; i++) {
-          OBJECT_SIZES.put(TEST_BUCKET + "/bench-200mb-" + i + ".bin", 200L * 1024 * 1024);
+        if (isGrpcTransport()) {
+          System.setProperty("gcs.sidecar.endpoint", mockServer.getGrpcEndpoint());
+          System.setProperty("gcs.sidecar.control.endpoint", mockServer.getGrpcEndpoint());
+          System.setProperty("gcs.sidecar.default.transport", "grpc");
+          System.setProperty("gcs.sidecar.transport", "grpc");
+        } else {
+          System.setProperty("gcs.sidecar.endpoint", mockServer.getHttpEndpoint());
+          System.setProperty("gcs.sidecar.control.endpoint", mockServer.getGrpcEndpoint());
+          System.setProperty("gcs.sidecar.default.transport", "json");
+          System.setProperty("gcs.sidecar.transport", "json");
         }
-        OBJECT_SIZES.put(TEST_BUCKET + "/bench-open-200mb.bin", 200L * 1024 * 1024);
-        OBJECT_SIZES.put(TEST_BUCKET + "/bench-random-100mb.bin", 100L * 1024 * 1024);
-        OBJECT_SIZES.put(TEST_BUCKET + "/smoke-test.bin", 16L * 1024 * 1024);
-
-        // Object data, metadata, and download handler
-        HttpHandler objectHandler = new HttpHandler() {
-          @Override
-          public void handle(HttpExchange exchange) throws IOException {
-            String path = exchange.getRequestURI().getPath();
-            String query = exchange.getRequestURI().getQuery();
-
-            if ("DELETE".equalsIgnoreCase(exchange.getRequestMethod())) {
-              exchange.sendResponseHeaders(204, -1);
-              exchange.close();
-              return;
-            }
-
-            if ("GET".equals(exchange.getRequestMethod())) {
-              String[] parts = path.split("/");
-              if ((query != null && query.contains("alt=media")) || path.startsWith("/download/")) {
-                String bucket = parts.length > 4 ? parts[4] : TEST_BUCKET;
-                String object = parts.length > 6 ? parts[6] : "bench-obj";
-                long size = OBJECT_SIZES.getOrDefault(bucket + "/" + object, 1024L);
-
-                String rangeHeader = exchange.getRequestHeaders().getFirst("Range");
-                long startOffset = 0;
-                long requestedLength = size;
-                if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
-                  String[] rParts = rangeHeader.substring(6).split("-");
-                  try {
-                    startOffset = Long.parseLong(rParts[0]);
-                    if (rParts.length > 1 && !rParts[1].isEmpty()) {
-                      long endOffset = Long.parseLong(rParts[1]);
-                      requestedLength = endOffset - startOffset + 1;
-                    } else {
-                      requestedLength = size - startOffset;
-                    }
-                  } catch (Exception ignored) {}
-                }
-
-                if (rangeHeader != null && (startOffset >= size || requestedLength <= 0)) {
-                  exchange.getResponseHeaders().set("Content-Range", "bytes */" + size);
-                  exchange.sendResponseHeaders(416, -1);
-                  exchange.close();
-                  return;
-                }
-
-                exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
-                exchange.getResponseHeaders().set("x-goog-generation", "1");
-                if (rangeHeader != null) {
-                  exchange.getResponseHeaders().set("Content-Range", String.format("bytes %d-%d/%d", startOffset, startOffset + requestedLength - 1, size));
-                  exchange.sendResponseHeaders(206, requestedLength);
-                } else {
-                  exchange.sendResponseHeaders(200, size);
-                }
-                byte[] chunk = new byte[65536];
-                long remaining = requestedLength;
-                try (OutputStream os = exchange.getResponseBody()) {
-                  while (remaining > 0) {
-                    int toWrite = (int) Math.min(chunk.length, remaining);
-                    os.write(chunk, 0, toWrite);
-                    remaining -= toWrite;
-                  }
-                } catch (IOException ignored) {}
-                return;
-              } else {
-                String listBucket = parts.length > 4 ? parts[4] : TEST_BUCKET;
-                if (path.contains("/o/") && parts.length > 6) {
-                  // Single object metadata GET
-                  String obj = parts[6];
-                  String json = String.format("{\"kind\":\"storage#object\",\"name\":\"%s\",\"bucket\":\"%s\",\"size\":\"1024\",\"generation\":\"1\"}", obj, listBucket);
-                  byte[] resp = json.getBytes(StandardCharsets.UTF_8);
-                  exchange.getResponseHeaders().set("Content-Type", "application/json");
-                  exchange.sendResponseHeaders(200, resp.length);
-                  try (OutputStream os = exchange.getResponseBody()) { os.write(resp); }
-                  return;
-                }
-                if (path.endsWith("/b") || path.endsWith("/b/")) {
-                  // List buckets
-                  String json = String.format("{\"kind\":\"storage#buckets\",\"items\":[{\"kind\":\"storage#bucket\",\"id\":\"%s\",\"name\":\"%s\"}]}", listBucket, listBucket);
-                  byte[] resp = json.getBytes(StandardCharsets.UTF_8);
-                  exchange.getResponseHeaders().set("Content-Type", "application/json");
-                  exchange.sendResponseHeaders(200, resp.length);
-                  try (OutputStream os = exchange.getResponseBody()) { os.write(resp); }
-                  return;
-                }
-                // List objects (100 items)
-                StringBuilder json = new StringBuilder("{\"kind\":\"storage#objects\",\"items\":[");
-                for (int i = 0; i < 100; i++) {
-                  if (i > 0) json.append(",");
-                  json.append(String.format("{\"name\":\"bench-obj-%03d\",\"bucket\":\"%s\",\"size\":\"1024\",\"generation\":\"1\",\"contentType\":\"application/octet-stream\"}", i, listBucket));
-                }
-                json.append("]}");
-                byte[] resp = json.toString().getBytes(StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(200, resp.length);
-                try (OutputStream os = exchange.getResponseBody()) { os.write(resp); }
-                return;
-              }
-            }
-            exchange.sendResponseHeaders(404, -1);
-          }
-        };
-
-        mockBackend.createContext("/storage/v1/b", objectHandler);
-        mockBackend.createContext("/download/storage/v1/b/", objectHandler);
-
-      // Upload handler
-      mockBackend.createContext("/upload/storage/v1/b/", new HttpHandler() {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-          String path = exchange.getRequestURI().getPath();
-          String query = exchange.getRequestURI().getQuery();
-          String[] parts = path.split("/");
-          String bucket = parts.length > 5 ? parts[5] : TEST_BUCKET;
-          String object = "bench-obj";
-          if (query != null && query.contains("name=")) {
-            for (String param : query.split("&")) {
-              if (param.startsWith("name=")) {
-                object = param.substring(5);
-              }
-            }
-          }
-
-          // Handle Resumable Upload session initiation
-          if ("POST".equalsIgnoreCase(exchange.getRequestMethod()) && query != null && query.contains("uploadType=resumable")) {
-            String location = "http://127.0.0.1:" + mockBackend.getAddress().getPort() + path + "?" + query + "&upload_id=session-1";
-            exchange.getResponseHeaders().set("Location", location);
-            exchange.sendResponseHeaders(200, -1);
-            exchange.close();
-            return;
-          }
-
-          long length = 0;
-          try (InputStream is = exchange.getRequestBody()) {
-            byte[] buf = new byte[65536];
-            int r;
-            while ((r = is.read(buf)) != -1) {
-              length += r;
-            }
-          }
-
-          // Handle Resumable Upload chunk PUT
-          String cr = exchange.getRequestHeaders().getFirst("Content-Range");
-          if (cr != null && cr.startsWith("bytes ")) {
-            String[] parts2 = cr.substring(6).split("/");
-            String rangePart = parts2[0];
-            long total = -1;
-            if (parts2.length > 1 && !parts2[1].equals("*")) {
-              try {
-                total = Long.parseLong(parts2[1]);
-              } catch (Exception ignored) {}
-            }
-            long end = -1;
-            if (rangePart.contains("-")) {
-              String[] r = rangePart.split("-");
-              if (r.length > 1 && !r[1].equals("*")) {
-                try {
-                  end = Long.parseLong(r[1]);
-                } catch (Exception ignored) {}
-              }
-            }
-            if (total > 0 && end >= 0 && end + 1 < total) {
-              // Intermediate chunk: respond 308 Resume Incomplete
-              exchange.getResponseHeaders().set("Range", "bytes=0-" + end);
-              exchange.sendResponseHeaders(308, -1);
-              exchange.close();
-              return;
-            }
-            if (total > 0) {
-              length = total;
-            }
-          }
-
-          OBJECT_SIZES.put(bucket + "/" + object, length);
-
-          String json = String.format("{\"kind\":\"storage#object\",\"name\":\"%s\",\"bucket\":\"%s\",\"size\":\"%d\",\"generation\":\"1\"}",
-              object, bucket, length);
-          byte[] resp = json.getBytes(StandardCharsets.UTF_8);
-          exchange.getResponseHeaders().set("Content-Type", "application/json");
-          exchange.sendResponseHeaders(200, resp.length);
-          try (OutputStream os = exchange.getResponseBody()) { os.write(resp); }
-        }
-      });
-
-        mockBackend.start();
-        int port = mockBackend.getAddress().getPort();
-        String endpoint = "http://127.0.0.1:" + port;
-        System.setProperty("gcs.sidecar.endpoint", endpoint);
-        System.setProperty("gcs.sidecar.default.transport", "json");
-        System.setProperty("gcs.sidecar.transport", "json");
-        log("Embedded mock backend started at: " + endpoint);
+        log(
+            String.format(
+                "Started dual-protocol MockStorageGrpcServer (gRPC=%s, HTTP=%s)",
+                mockServer.getGrpcEndpoint(), mockServer.getHttpEndpoint()));
       }
-    } else {
-      log("Live benchmark enabled against GCP. Mock backend disabled.");
     }
 
+    StorageOptions baseOptions = buildStorageOptions();
     if ("native".equalsIgnoreCase(DRIVER)) {
-      String nativeTransport = System.getProperty("gcs.native.transport", IS_LIVE ? "grpc" : "json");
-      log("Initializing Native Java Storage client (StorageOptions) with transport: " + nativeTransport.toUpperCase());
-      StorageOptions.Builder builder = "json".equalsIgnoreCase(nativeTransport)
-          ? StorageOptions.http()
-          : StorageOptions.grpc();
-      if (builder instanceof GrpcStorageOptions.Builder) {
-        boolean directPath = Boolean.parseBoolean(System.getProperty("gcs.grpc.directpath", "false"));
-        ((GrpcStorageOptions.Builder) builder).setAttemptDirectPath(directPath);
-        log("DirectPath configuration on Native gRPC client: " + directPath);
+      int poolSize = Math.max(1, Integer.getInteger("gcs.native.channel.pool.size", 1));
+      storage = baseOptions.getService();
+      nativeClientPool.add(storage);
+      for (int i = 1; i < poolSize; i++) {
+        nativeClientPool.add(buildStorageOptions().getService());
       }
-      String project = System.getProperty("gcs.project.id", System.getenv("GOOGLE_CLOUD_PROJECT"));
-      if (project != null && !project.isEmpty()) {
-        builder.setProjectId(project);
-      }
-      if (!IS_LIVE) {
-        builder.setCredentials(NoCredentials.getInstance());
-      }
-      if (!IS_LIVE && mockBackend != null) {
-        builder.setHost("http://127.0.0.1:" + mockBackend.getAddress().getPort());
-      }
-      storage = builder.build().getService();
       udsStorageHandler = null;
-      log("Native Storage client instantiated successfully (" + nativeTransport.toUpperCase() + ").\n");
+      log(
+          String.format(
+              "Initialized Native Storage client (%s, clientPoolSize=%d).",
+              activeTransport.toUpperCase(), nativeClientPool.size()));
     } else {
-      // 2. Start sidecar process
-      log("Initializing local Rust sidecar process...");
-      processManager = RustSidecarProcessManager.createDefault();
-      processManager.start(Duration.ofSeconds(10));
-      Path socketPath = processManager.getSocketPath();
-      log("Rust sidecar process started successfully at: " + socketPath);
-
-      // 3. Connect tuned Netty gRPC UDS ManagedChannel
-      log("Connecting tuned gRPC UDS ManagedChannel via EpollDomainSocketChannel...");
-      channel = UdsChannelFactory.createChannel(socketPath);
-      log("Tuned gRPC UDS channel connected.");
-
-      // 4. Instantiate Storage veneer client
-      log("Instantiating Storage veneer client wrapper with token lending session...");
-      storage = UdsStorage.create(channel);
+      DriverMode mode =
+          "uds-inproc".equalsIgnoreCase(DRIVER) ? DriverMode.INPROC : DriverMode.SIDECAR;
+      Transport protoTransport = isGrpcTransport() ? Transport.GRPC : Transport.JSON;
+      storage =
+          UdsStorage.newBuilder(baseOptions)
+              .setDriverMode(mode)
+              .setTransport(protoTransport)
+              .build();
       udsStorageHandler = (UdsStorage) Proxy.getInvocationHandler(storage);
-      String sessId = (udsStorageHandler.getSessionManager() != null)
-          ? udsStorageHandler.getSessionManager().getSessionId()
-          : "unauthenticated";
-      log("Storage veneer client ready with session ID: " + sessId + "\n");
-
-      // Capture baseline stats
       try {
         initialStats = udsStorageHandler.getStats(true);
-        log(String.format("Baseline Sidecar Telemetry: PID=%d, Threads=%d, RSS=%d KiB",
-            initialStats.getPid(), initialStats.getThreads(), initialStats.getRssBytes() / 1024));
+        log(
+            String.format(
+                "Baseline %s Telemetry: PID=%d, Threads=%d, RSS=%,d KiB",
+                mode == DriverMode.INPROC ? "Unified Process (JVM+Rust)" : "Sidecar Process",
+                initialStats.getPid(),
+                initialStats.getThreads(),
+                initialStats.getRssBytes() / 1024));
       } catch (Exception e) {
         log("Note: Could not capture initial stats: " + e.getMessage());
       }
     }
   }
 
+  private static StorageOptions buildStorageOptions() {
+    StorageOptions.Builder builder =
+        isGrpcTransport() ? StorageOptions.grpc() : StorageOptions.http();
+    if (builder instanceof GrpcStorageOptions.Builder) {
+      boolean directPath = Boolean.parseBoolean(System.getProperty("gcs.grpc.directpath", "false"));
+      ((GrpcStorageOptions.Builder) builder).setAttemptDirectPath(directPath);
+    }
+    String project =
+        System.getProperty(
+            "gcs.project.id",
+            System.getenv("GOOGLE_CLOUD_PROJECT") != null
+                ? System.getenv("GOOGLE_CLOUD_PROJECT")
+                : "vaibhavpratap-sdk-test");
+    builder.setProjectId(project);
+    if (!IS_LIVE) {
+      builder.setCredentials(NoCredentials.getInstance());
+      if (mockServer != null) {
+        builder.setHost(
+            isGrpcTransport() ? mockServer.getGrpcEndpoint() : mockServer.getHttpEndpoint());
+      }
+    }
+    return builder.build();
+  }
+
+  private static void seedMockFixtures(MockStorageGrpcServer srv) {
+    srv.addBucket(TEST_BUCKET);
+    for (int i = 0; i < 99; i++) {
+      srv.addBucket(String.format("bench-bucket-%03d", i));
+    }
+    srv.putVirtualObject(TEST_BUCKET, "bench-open-200mb.bin", 200L * 1024 * 1024);
+    srv.putVirtualObject(TEST_BUCKET, "bench-random-100mb.bin", 100L * 1024 * 1024);
+    byte[] smoke = new byte[16 * 1024 * 1024];
+    new Random(7).nextBytes(smoke);
+    srv.putBytes(TEST_BUCKET, "smoke-test.bin", smoke, "application/octet-stream");
+    for (int i = 0; i < 48; i++) {
+      srv.putVirtualObject(TEST_BUCKET, "bench-200mb-" + i + ".bin", 200L * 1024 * 1024);
+    }
+    byte[] smallPayload = "list-fixture-item".getBytes(StandardCharsets.UTF_8);
+    for (int i = 0; i < 100; i++) {
+      srv.putBytes(
+          TEST_BUCKET,
+          String.format("list-bench-100/item-%03d.bin", i),
+          smallPayload,
+          "application/octet-stream");
+    }
+  }
+
   @AfterClass
   public static void tearDown() throws Exception {
-    banner("BENCHMARK TEARDOWN & FINAL METRICS REPORT");
+    int postWaitSec = Integer.getInteger("gcs.bench.post.wait.sec", 0);
+    if (postWaitSec > 0) {
+      log(
+          String.format(
+              "Waiting %d seconds post-suite for trailing Cloud Monitoring points to flush...",
+              postWaitSec));
+      Thread.sleep(postWaitSec * 1000L);
+    }
 
-    // Capture final sidecar process telemetry if UDS was used
+    banner("BENCHMARK TEARDOWN & FINAL METRICS REPORT");
     if (udsStorageHandler != null) {
       try {
         finalStats = udsStorageHandler.getStats(false);
@@ -411,51 +311,194 @@ public class ITUdsVeneerBenchmark {
 
     if (!TIMELINE_RECORDS.isEmpty()) {
       try {
-        String timelineFile = System.getProperty("gcs.bench.timeline.file", "/tmp/benchmark_timeline.json");
+        String timelineFile =
+            System.getProperty("gcs.bench.timeline.file", "/tmp/benchmark_timeline.json");
         StringBuilder sb = new StringBuilder("[\n");
         for (int i = 0; i < TIMELINE_RECORDS.size(); i++) {
           sb.append("  ").append(TIMELINE_RECORDS.get(i));
-          if (i < TIMELINE_RECORDS.size() - 1) sb.append(",");
+          if (i < TIMELINE_RECORDS.size() - 1) {
+            sb.append(",");
+          }
           sb.append("\n");
         }
         sb.append("]\n");
         Files.write(Paths.get(timelineFile), sb.toString().getBytes(StandardCharsets.UTF_8));
-        log("Saved benchmark timeline to " + timelineFile + " (" + TIMELINE_RECORDS.size() + " entries)");
+        log("Saved benchmark timeline to " + timelineFile);
       } catch (Exception e) {
         log("Warning: Failed to write timeline: " + e.getMessage());
       }
     }
 
-    if (storage != null && storage instanceof AutoCloseable) {
-      log("Closing Storage veneer client and session...");
+    for (Storage pooled : nativeClientPool) {
+      if (pooled != storage) {
+        try {
+          pooled.close();
+        } catch (Throwable ignored) {
+        }
+      }
+    }
+    nativeClientPool.clear();
+
+    if (storage != null) {
       try {
-        ((AutoCloseable) storage).close();
-      } catch (Throwable ignored) {}
+        storage.close();
+      } catch (Throwable ignored) {
+      }
+      storage = null;
     }
-    if (channel != null) {
-      channel.shutdownNow();
+    if (mockServer != null) {
+      mockServer.close();
+      mockServer = null;
+      System.clearProperty("gcs.sidecar.endpoint");
+      System.clearProperty("gcs.sidecar.control.endpoint");
+      System.clearProperty("gcs.sidecar.default.transport");
+      System.clearProperty("gcs.sidecar.transport");
     }
-    if (processManager != null) {
-      log("Stopping Rust sidecar process...");
-      processManager.close();
-    }
-    if (mockBackend != null) {
-      log("Stopping embedded mock backend...");
-      mockBackend.stop(0);
-    }
-    System.clearProperty("gcs.sidecar.endpoint");
-    System.clearProperty("gcs.sidecar.default.transport");
-    System.clearProperty("gcs.sidecar.transport");
     log("Cleanup complete.");
   }
 
   @After
   public void tearDownTestMethod() throws Exception {
-    int pauseSec = Integer.getInteger("gcs.bench.pause.sec", 0);
+    int pauseSec = Integer.getInteger("gcs.bench.pause.sec", IS_LIVE ? 75 : 0);
     if (pauseSec > 0) {
-      log(String.format("Quiescing for %d seconds to isolate Cloud Monitoring telemetry...", pauseSec));
+      log(
+          String.format(
+              "Quiescing for %d seconds to isolate 60s Cloud Monitoring buckets...", pauseSec));
       Thread.sleep(pauseSec * 1000L);
     }
+  }
+
+  // =========================================================================
+  // TELEMETRY & PERCENTILE HELPERS
+  // =========================================================================
+
+  /** Exact linear-interpolated percentile over a sorted non-empty sample list (`p` in `[0, 1]`). */
+  static double percentile(List<Double> sorted, double p) {
+    if (sorted == null || sorted.isEmpty()) {
+      return 0.0;
+    }
+    if (sorted.size() == 1) {
+      return sorted.get(0);
+    }
+    double rank = p * (sorted.size() - 1);
+    int low = (int) Math.floor(rank);
+    int high = (int) Math.ceil(rank);
+    if (low == high) {
+      return sorted.get(low);
+    }
+    double weight = rank - low;
+    return sorted.get(low) * (1.0 - weight) + sorted.get(high) * weight;
+  }
+
+  private static double toDecimalMbPerSec(long totalBytes, double elapsedSec) {
+    return elapsedSec > 0 ? (totalBytes / 1_000_000.0) / elapsedSec : 0.0;
+  }
+
+  private static double toBinaryMibPerSec(long totalBytes, double elapsedSec) {
+    return elapsedSec > 0 ? (totalBytes / 1_048_576.0) / elapsedSec : 0.0;
+  }
+
+  private static long readJvmProcessCpuNanos() {
+    java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
+    try {
+      Class<?> sunOsBean = Class.forName("com.sun.management.OperatingSystemMXBean");
+      if (sunOsBean.isInstance(bean)) {
+        Method m = sunOsBean.getMethod("getProcessCpuTime");
+        return (Long) m.invoke(bean);
+      }
+    } catch (Throwable ignored) {
+    }
+    return 0L;
+  }
+
+  private static void resetJvmPeakRss() {
+    try {
+      Files.write(Paths.get("/proc/self/clear_refs"), "5".getBytes(StandardCharsets.US_ASCII));
+    } catch (Throwable ignored) {
+    }
+  }
+
+  private static double readJvmPeakRssMib() {
+    try {
+      List<String> lines = Files.readAllLines(Paths.get("/proc/self/status"), StandardCharsets.UTF_8);
+      for (String line : lines) {
+        if (line.startsWith("VmHWM:")) {
+          String[] parts = line.trim().split("\\s+");
+          if (parts.length >= 2) {
+            return Long.parseLong(parts[1]) / 1024.0;
+          }
+        }
+      }
+    } catch (Throwable ignored) {
+    }
+    return 0.0;
+  }
+
+  private static final class WorkloadTelemetrySnapshot {
+    final long jvmCpuStartNs;
+    final StatsResponse rustStart;
+
+    WorkloadTelemetrySnapshot(long jvmCpuStartNs, StatsResponse rustStart) {
+      this.jvmCpuStartNs = jvmCpuStartNs;
+      this.rustStart = rustStart;
+    }
+  }
+
+  private static final class WorkloadTelemetryDelta {
+    final double jvmCpuSec;
+    final double jvmPeakRssMib;
+    final double rustCpuSec;
+    final double rustPeakRssMib;
+
+    WorkloadTelemetryDelta(
+        double jvmCpuSec, double jvmPeakRssMib, double rustCpuSec, double rustPeakRssMib) {
+      this.jvmCpuSec = jvmCpuSec;
+      this.jvmPeakRssMib = jvmPeakRssMib;
+      this.rustCpuSec = rustCpuSec;
+      this.rustPeakRssMib = rustPeakRssMib;
+    }
+  }
+
+  private static WorkloadTelemetrySnapshot beginWorkloadTelemetry() {
+    resetJvmPeakRss();
+    StatsResponse rs = null;
+    if (udsStorageHandler != null) {
+      try {
+        rs = udsStorageHandler.getStats(/* resetPeakRss= */ true);
+      } catch (Throwable ignored) {
+      }
+    }
+    return new WorkloadTelemetrySnapshot(readJvmProcessCpuNanos(), rs);
+  }
+
+  private static WorkloadTelemetryDelta endWorkloadTelemetry(WorkloadTelemetrySnapshot start) {
+    long jvmEndNs = readJvmProcessCpuNanos();
+    double jvmCpuSec = Math.max(0.0, (jvmEndNs - start.jvmCpuStartNs) / 1_000_000_000.0);
+    double jvmHwmMib = readJvmPeakRssMib();
+    double rustCpuSec = 0.0;
+    double rustHwmMib = 0.0;
+    if (udsStorageHandler != null && start.rustStart != null) {
+      try {
+        StatsResponse end = udsStorageHandler.getStats(/* resetPeakRss= */ false);
+        double startTot = start.rustStart.getCpuUserSecs() + start.rustStart.getCpuSysSecs();
+        double endTot = end.getCpuUserSecs() + end.getCpuSysSecs();
+        rustCpuSec = Math.max(0.0, endTot - startTot);
+        rustHwmMib = end.getPeakRssBytes() / 1_048_576.0;
+      } catch (Throwable ignored) {
+      }
+    }
+    return new WorkloadTelemetryDelta(jvmCpuSec, jvmHwmMib, rustCpuSec, rustHwmMib);
+  }
+
+  private static String resolveExistingObject(String preferred, String fallback) {
+    try {
+      Blob b = storage.get(BlobId.of(TEST_BUCKET, preferred));
+      if (b != null) {
+        return preferred;
+      }
+    } catch (Throwable ignored) {
+    }
+    return fallback;
   }
 
   // =========================================================================
@@ -466,13 +509,12 @@ public class ITUdsVeneerBenchmark {
   public void test00_PingLatencyMicrobenchmark() throws Exception {
     banner("TEST 00: Pure UDS gRPC IPC Ping Round-Trip Microbenchmark");
     if (udsStorageHandler == null) {
-      log("Skipping pure UDS Ping microbenchmark for Native driver (Ping is a UDS IPC RPC only).");
+      log("Skipping UDS Ping microbenchmark for Native driver.");
       return;
     }
-    int[] sizes = new int[] { 1, 1024, 64 * 1024, 1024 * 1024 };
-    String[] labels = new String[] { "1 Byte", "1 KiB", "64 KiB", "1 MiB" };
+    int[] sizes = new int[] {1, 1024, 64 * 1024, 1024 * 1024};
+    String[] labels = new String[] {"1 Byte", "1 KiB", "64 KiB", "1 MiB"};
 
-    // Warm-up 20 iterations
     for (int i = 0; i < 20; i++) {
       udsStorageHandler.ping(new byte[16]);
     }
@@ -484,7 +526,7 @@ public class ITUdsVeneerBenchmark {
       new Random(100 + s).nextBytes(payload);
 
       int iterations = (size > 64 * 1024) ? 50 : 100;
-      List<Double> latencies = new ArrayList<>();
+      List<Double> latencies = new ArrayList<Double>(iterations);
       long startTotalNs = System.nanoTime();
 
       for (int i = 0; i < iterations; i++) {
@@ -497,356 +539,567 @@ public class ITUdsVeneerBenchmark {
 
       double totalSec = (System.nanoTime() - startTotalNs) / 1_000_000_000.0;
       Collections.sort(latencies);
-      double p50 = latencies.get((int) (latencies.size() * 0.50));
-      double p90 = latencies.get((int) (latencies.size() * 0.90));
-      double p99 = latencies.get((int) (latencies.size() * 0.99));
-      double avg = latencies.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-      double throughputMb = ((long) size * iterations / 1024.0 / 1024.0) / totalSec;
-      double opsSec = iterations / totalSec;
+      double p50 = percentile(latencies, 0.50);
+      double p90 = percentile(latencies, 0.90);
+      double p99 = percentile(latencies, 0.99);
+      long totalBytes = (long) size * iterations;
+      double mbSec = toDecimalMbPerSec(totalBytes, totalSec);
+      double mibSec = toBinaryMibPerSec(totalBytes, totalSec);
 
-      log(String.format("UDS Ping %-8s : P50=%.3f ms | P90=%.3f ms | P99=%.3f ms | Avg=%.3f ms | %6.1f ops/s | %6.2f MB/s",
-          label, p50, p90, p99, avg, opsSec, throughputMb));
+      log(
+          String.format(
+              "UDS Ping %-8s : P50=%.3f ms | P90=%.3f ms | P99=%.3f ms | %.2f MB/s (%.2f MiB/s)",
+              label, p50, p90, p99, mbSec, mibSec));
 
-      recordedMetrics.add(new BenchmarkMetric(
-          "Ping " + label,
-          size,
-          1,
-          iterations,
-          p50, p90, p99, throughputMb,
-          p50, p90, p99, throughputMb,
-          getUsedHeapMb()
-      ));
+      recordedMetrics.add(
+          new BenchmarkMetric(
+              "Ping " + label,
+              size,
+              1,
+              iterations,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              p50,
+              p90,
+              p99,
+              mbSec,
+              mibSec,
+              getUsedHeapMb(),
+              new WorkloadTelemetryDelta(0, 0, 0, 0)));
     }
   }
 
   // =========================================================================
-  // SECTION 0A: PHASE 4 PRE-FLIGHT SMOKE TEST (BidiReadObject)
+  // SECTION 0A: PRE-FLIGHT SMOKE TEST
   // =========================================================================
 
   @Test
   public void test00a_SmokeTestBidiRead() throws Exception {
-    banner("TEST 00A: Phase 4 Pre-flight Smoke Test on BidiReadObject");
+    banner("TEST 00A: Pre-flight Smoke Test (16 MiB Download)");
     String smokeObject = "smoke-test.bin";
-    log(String.format("Executing BidiReadObject smoke test on %s/%s ...", TEST_BUCKET, smokeObject));
-
     long startNs = System.nanoTime();
     byte[] data = storage.readAllBytes(BlobId.of(TEST_BUCKET, smokeObject));
     long elapsedNs = System.nanoTime() - startNs;
 
-    Assert.assertNotNull("Downloaded smoke-test data must not be null", data);
-    Assert.assertEquals("Expected exact 16 MB payload (16,777,216 bytes)", 16 * 1024 * 1024, data.length);
-
-    double elapsedSec = elapsedNs / 1_000_000_000.0;
-    double throughputMb = (data.length / 1024.0 / 1024.0) / elapsedSec;
-
-    log(String.format("PASSED: Successfully read %,d bytes in %.3f s (%.2f MB/s) with HTTP 200 / OK status and zero errors.",
-        data.length, elapsedSec, throughputMb));
-
-    BenchmarkMetric metric = new BenchmarkMetric(
-        getTransportPrefix() + "SmokeTest BidiRead (16 MB)",
-        16 * 1024 * 1024,
-        1,
-        1,
-        0.0, 0.0, 0.0, 0.0,
-        elapsedSec * 1000.0, elapsedSec * 1000.0, elapsedSec * 1000.0, throughputMb,
-        getUsedHeapMb()
-    );
-    recordedMetrics.add(metric);
+    Assert.assertNotNull(data);
+    Assert.assertEquals(16 * 1024 * 1024, data.length);
+    double sec = elapsedNs / 1_000_000_000.0;
+    log(
+        String.format(
+            "PASSED: Read %,d bytes in %.3f s (%.2f MB/s / %.2f MiB/s).",
+            data.length, sec, toDecimalMbPerSec(data.length, sec), toBinaryMibPerSec(data.length, sec)));
   }
 
   // =========================================================================
-  // SECTION 0B: WORKLOAD 1 - OPEN (200 MB BidiRead Streaming Handshake)
+  // WORKLOAD 1 — OPEN (200 MB BidiRead Streaming Handshake ONLY)
   // =========================================================================
 
   @Test
   public void test00b_Open_200MB() throws Exception {
-    banner("WORKLOAD 1: Open (Start a BidiRead streaming request on a 200 MB object)");
-    String targetObject = System.getProperty("gcs.bench.open.object", "bench-open-200mb.bin");
-    try {
-      Blob b = storage.get(BlobId.of(TEST_BUCKET, targetObject));
-      if (b == null) targetObject = "bench-200mb-0.bin";
-    } catch (Throwable t) {
-      targetObject = "bench-200mb-0.bin";
+    banner("WORKLOAD 1: Open (Start BidiReadSession handshake on 200 MB object)");
+    if (!isGrpcTransport()) {
+      log("Skipping BidiRead Open workload under JSON transport (BidiReadObject is gRPC-only).");
+      return;
     }
 
-    int iterations = Integer.getInteger("gcs.bench.open.iterations", IS_LIVE ? 20 : 2);
-    log(String.format("Executing %d open stream iterations against %s/%s ...", iterations, TEST_BUCKET, targetObject));
-
-    Instant wlStart = Instant.now();
-    List<Double> openLatencies = new ArrayList<>();
+    String targetObject =
+        resolveExistingObject(
+            System.getProperty("gcs.bench.open.object", "bench-open-200mb.bin"),
+            "bench-200mb-0.bin");
     BlobId blobId = BlobId.of(TEST_BUCKET, targetObject);
+    int minIterations = Integer.getInteger("gcs.bench.open.iterations", IS_LIVE ? 50 : 5);
 
-    for (int i = 0; i < iterations; i++) {
+    if (ENABLE_WARMUP) {
+      int warmupOps = IS_LIVE ? 3 : 1;
+      for (int w = 0; w < warmupOps; w++) {
+        try (BlobReadSession s = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS)) {
+          Assert.assertNotNull(s.getBlobInfo());
+        }
+      }
+    }
+
+    WorkloadTelemetrySnapshot snap = beginWorkloadTelemetry();
+    Instant wlStart = Instant.now();
+    long loopStartNs = System.nanoTime();
+    long minDeadlineMs =
+        MIN_WINDOW_SEC > 0 ? (System.currentTimeMillis() + MIN_WINDOW_SEC * 1000L) : 0L;
+    List<Double> openLatencies = new ArrayList<Double>(minIterations);
+
+    while (openLatencies.size() < minIterations || System.currentTimeMillis() < minDeadlineMs) {
+      BlobReadSession session = null;
       long startNs = System.nanoTime();
       try {
-        BlobReadSession session = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS);
-        ApiFuture<byte[]> fProbe = session.readAs(ReadProjectionConfigs.asFutureBytes().withRangeSpec(RangeSpec.of(0, 1024)));
-        fProbe.get(120, TimeUnit.SECONDS);
-        session.close();
-      } catch (Throwable t) {
-        log("Open error: " + t.getMessage());
-        break;
+        session = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS);
+        long elapsedNs = System.nanoTime() - startNs;
+        Assert.assertNotNull(session.getBlobInfo());
+        if (session.getBlobInfo().getSize() != null) {
+          Assert.assertEquals(200L * 1024 * 1024, session.getBlobInfo().getSize().longValue());
+        }
+        openLatencies.add(elapsedNs / 1_000_000.0);
+      } finally {
+        // Close outside [startNs, elapsedNs] so Open measures strictly the BidiReadObject handshake.
+        if (session != null) {
+          session.close();
+        }
       }
-      long elapsedNs = System.nanoTime() - startNs;
-      openLatencies.add(elapsedNs / 1_000_000.0);
     }
+
+    double activeWallSec = (System.nanoTime() - loopStartNs) / 1_000_000_000.0;
     Instant wlEnd = Instant.now();
+    WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
     recordTimeline("WL1_Open_200MB", wlStart, wlEnd);
 
-    if (!openLatencies.isEmpty()) {
-      Collections.sort(openLatencies);
-      double p50 = openLatencies.get((int) (openLatencies.size() * 0.50));
-      double p90 = openLatencies.get((int) (openLatencies.size() * 0.90));
-      double p99 = openLatencies.get((int) (openLatencies.size() * 0.99));
-      double avg = openLatencies.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-      double opsSec = avg > 0 ? (1000.0 / avg) : 0.0;
+    Collections.sort(openLatencies);
+    double p50 = percentile(openLatencies, 0.50);
+    double p90 = percentile(openLatencies, 0.90);
+    double p99 = percentile(openLatencies, 0.99);
+    double opsSec = activeWallSec > 0 ? (openLatencies.size() / activeWallSec) : 0.0;
 
-      log(String.format("Open (200MB) Results: %d runs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.1f ops/sec",
-          openLatencies.size(), p50, p90, p99, opsSec));
+    log(
+        String.format(
+            "Open (200MB) Results: %d opens in %.2fs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.1f ops/sec",
+            openLatencies.size(), activeWallSec, p50, p90, p99, opsSec));
 
-      BenchmarkMetric metric = new BenchmarkMetric(
-          getTransportPrefix() + "Open (200MB)",
-          200 * 1024 * 1024,
-          1,
-          openLatencies.size(),
-          0.0, 0.0, 0.0, 0.0,
-          p50, p90, p99, opsSec,
-          getUsedHeapMb()
-      );
-      recordedMetrics.add(metric);
-    }
+    recordedMetrics.add(
+        new BenchmarkMetric(
+            getTransportPrefix() + "Open (200MB)",
+            200 * 1024 * 1024,
+            1,
+            openLatencies.size(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            p50,
+            p90,
+            p99,
+            opsSec,
+            opsSec,
+            getUsedHeapMb(),
+            delta));
   }
 
   // =========================================================================
-  // SECTION 0C: WORKLOAD 2 - Read50x2x4 Serial
+  // WORKLOAD 2 — Read50x2x4 Serial (1:1 API Symmetry Across Native & UDS)
   // =========================================================================
 
   @Test
   public void test00c_Read50x2x4_Serial() throws Exception {
-    banner("WORKLOAD 2: Read50x2x4 Serial (Read 50 ranges of 2 MB with 4 MB stride)");
-    String targetObject = System.getProperty("gcs.bench.read50.object", "bench-open-200mb.bin");
-    try {
-      Blob b = storage.get(BlobId.of(TEST_BUCKET, targetObject));
-      if (b == null) targetObject = "bench-200mb-0.bin";
-    } catch (Throwable t) {
-      targetObject = "bench-200mb-0.bin";
-    }
-
-    int iterations = Integer.getInteger("gcs.bench.read50.iterations", IS_LIVE ? 5 : 1);
-    log(String.format("Executing %d serial 50x2x4 iterations against %s/%s ...", iterations, TEST_BUCKET, targetObject));
-
-    Instant wlStart = Instant.now();
-    List<Double> iterationLatencies = new ArrayList<>();
+    banner("WORKLOAD 2: Read50x2x4 Serial (50 x 2 MiB ranges at 4 MiB stride)");
+    String targetObject =
+        resolveExistingObject(
+            System.getProperty("gcs.bench.read50.object", "bench-open-200mb.bin"),
+            "bench-200mb-0.bin");
     BlobId blobId = BlobId.of(TEST_BUCKET, targetObject);
+    int minIterations = Integer.getInteger("gcs.bench.read50.iterations", IS_LIVE ? 20 : 2);
+    boolean useBidi = isGrpcTransport();
 
-    for (int it = 0; it < iterations; it++) {
-      long iterStartNs = System.nanoTime();
-      try {
-        BlobReadSession session = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS);
-        long totalBytes = 0;
-        for (int r = 0; r < 50; r++) {
-          long offset = r * 4L * 1024 * 1024; // 4MB stride (0, 4, 8, ... 196 MB)
-          ApiFuture<byte[]> f = session.readAs(ReadProjectionConfigs.asFutureBytes().withRangeSpec(RangeSpec.of(offset, 2 * 1024 * 1024)));
-          byte[] b = f.get(120, TimeUnit.SECONDS);
-          totalBytes += b.length;
-        }
-        session.close();
-      } catch (Throwable t) {
-        log("Read50x2x4 Serial error: " + t.getMessage());
-        break;
-      }
-      long iterElapsedNs = System.nanoTime() - iterStartNs;
-      iterationLatencies.add(iterElapsedNs / 1_000_000.0);
+    if (ENABLE_WARMUP) {
+      runSingleSerial50x2x4Pass(blobId, useBidi);
     }
+
+    WorkloadTelemetrySnapshot snap = beginWorkloadTelemetry();
+    Instant wlStart = Instant.now();
+    long activeTransferNs = 0L;
+    long minDeadlineMs =
+        MIN_WINDOW_SEC > 0 ? (System.currentTimeMillis() + MIN_WINDOW_SEC * 1000L) : 0L;
+    List<Double> iterationLatencies = new ArrayList<Double>(minIterations);
+    long totalBytesAllRuns = 0L;
+
+    while (iterationLatencies.size() < minIterations
+        || System.currentTimeMillis() < minDeadlineMs) {
+      long elapsedNs = runSingleSerial50x2x4Pass(blobId, useBidi);
+      activeTransferNs += elapsedNs;
+      totalBytesAllRuns += 100L * 1024 * 1024;
+      iterationLatencies.add(elapsedNs / 1_000_000.0);
+    }
+
     Instant wlEnd = Instant.now();
+    WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
     recordTimeline("WL2_Read50x2x4_Serial", wlStart, wlEnd);
 
-    if (!iterationLatencies.isEmpty()) {
-      Collections.sort(iterationLatencies);
-      double p50 = iterationLatencies.get((int) (iterationLatencies.size() * 0.50));
-      double p90 = iterationLatencies.get((int) (iterationLatencies.size() * 0.90));
-      double p99 = iterationLatencies.get((int) (iterationLatencies.size() * 0.99));
-      double avgSec = (iterationLatencies.stream().mapToDouble(Double::doubleValue).average().orElse(0.0)) / 1000.0;
-      double throughputMb = avgSec > 0 ? (100.0 / avgSec) : 0.0; // 50 * 2MB = 100MB per iteration
+    Collections.sort(iterationLatencies);
+    double p50 = percentile(iterationLatencies, 0.50);
+    double p90 = percentile(iterationLatencies, 0.90);
+    double p99 = percentile(iterationLatencies, 0.99);
+    double activeSec = activeTransferNs / 1_000_000_000.0;
+    double mbSec = toDecimalMbPerSec(totalBytesAllRuns, activeSec);
+    double mibSec = toBinaryMibPerSec(totalBytesAllRuns, activeSec);
 
-      log(String.format("Read50x2x4 Serial Results: %d runs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s",
-          iterationLatencies.size(), p50, p90, p99, throughputMb));
+    log(
+        String.format(
+            "Read50x2x4 Serial Results: %d runs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s (%.2f MiB/s)",
+            iterationLatencies.size(), p50, p90, p99, mbSec, mibSec));
 
-      BenchmarkMetric metric = new BenchmarkMetric(
-          getTransportPrefix() + "Read50x2x4 Serial",
-          100 * 1024 * 1024,
-          1,
-          iterationLatencies.size(),
-          0.0, 0.0, 0.0, 0.0,
-          p50, p90, p99, throughputMb,
-          getUsedHeapMb()
-      );
-      recordedMetrics.add(metric);
+    recordedMetrics.add(
+        new BenchmarkMetric(
+            getTransportPrefix() + "Read50x2x4 Serial",
+            100 * 1024 * 1024,
+            1,
+            iterationLatencies.size(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            p50,
+            p90,
+            p99,
+            mbSec,
+            mibSec,
+            getUsedHeapMb(),
+            delta));
+  }
+
+  private static long runSingleSerial50x2x4Pass(BlobId blobId, boolean useBidi) throws Exception {
+    if (useBidi) {
+      try (BlobReadSession session = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS)) {
+        long startNs = System.nanoTime();
+        long bytes = 0;
+        for (int r = 0; r < 50; r++) {
+          long offset = r * 4L * 1024 * 1024;
+          byte[] b =
+              session
+                  .readAs(
+                      ReadProjectionConfigs.asFutureBytes()
+                          .withRangeSpec(RangeSpec.of(offset, 2 * 1024 * 1024)))
+                  .get(120, TimeUnit.SECONDS);
+          bytes += b.length;
+        }
+        long elapsed = System.nanoTime() - startNs;
+        Assert.assertEquals(100L * 1024 * 1024, bytes);
+        return elapsed;
+      }
+    } else {
+      ByteBuffer bb = ByteBuffer.allocate(2 * 1024 * 1024);
+      long startNs = System.nanoTime();
+      long bytes = 0;
+      for (int r = 0; r < 50; r++) {
+        long offset = r * 4L * 1024 * 1024;
+        bb.clear();
+        try (ReadChannel reader = storage.reader(blobId)) {
+          reader.seek(offset);
+          reader.limit(offset + 2L * 1024 * 1024);
+          while (bb.hasRemaining()) {
+            if (reader.read(bb) == -1) {
+              break;
+            }
+          }
+        }
+        bytes += bb.position();
+      }
+      long elapsed = System.nanoTime() - startNs;
+      Assert.assertEquals(100L * 1024 * 1024, bytes);
+      return elapsed;
     }
   }
 
   // =========================================================================
-  // SECTION 0D: WORKLOAD 3 - Read50x2x4 Concurrent
+  // WORKLOAD 3 — Read50x2x4 Concurrent (Strict 1:1 Symmetry on Native & UDS)
   // =========================================================================
 
   @Test
   public void test00d_Read50x2x4_Concurrent() throws Exception {
-    banner("WORKLOAD 3: Read50x2x4 Concurrent (Read 50 ranges of 2 MB with 4 MB stride concurrently)");
-    String targetObject = System.getProperty("gcs.bench.read50.object", "bench-open-200mb.bin");
-    try {
-      Blob b = storage.get(BlobId.of(TEST_BUCKET, targetObject));
-      if (b == null) targetObject = "bench-200mb-0.bin";
-    } catch (Throwable t) {
-      targetObject = "bench-200mb-0.bin";
-    }
-
-    int iterations = Integer.getInteger("gcs.bench.read50.iterations", IS_LIVE ? 5 : 1);
-    int concurrency = 16;
-    log(String.format("Executing %d concurrent 50x2x4 iterations (%d threads) against %s/%s ...",
-        iterations, concurrency, TEST_BUCKET, targetObject));
-
-    Instant wlStart = Instant.now();
-    List<Double> iterationLatencies = new ArrayList<>();
-    ExecutorService executor = Executors.newFixedThreadPool(concurrency);
+    banner("WORKLOAD 3: Read50x2x4 Concurrent (50 x 2 MiB ranges concurrently, 1:1 API symmetry)");
+    String targetObject =
+        resolveExistingObject(
+            System.getProperty("gcs.bench.read50.object", "bench-open-200mb.bin"),
+            "bench-200mb-0.bin");
     final BlobId blobId = BlobId.of(TEST_BUCKET, targetObject);
+    int minIterations = Integer.getInteger("gcs.bench.read50.iterations", IS_LIVE ? 20 : 2);
+    int concurrency = Integer.getInteger("gcs.bench.wl3.concurrency", 16);
+    String defaultMode = isGrpcTransport() ? "single" : "reader";
+    String wl3Mode = System.getProperty("gcs.bench.wl3.mode", defaultMode).trim().toLowerCase();
+    int sessionPoolSize =
+        "pooled".equals(wl3Mode)
+            ? Math.max(1, Math.min(50, Integer.getInteger("gcs.bench.wl3.sessions", concurrency)))
+            : 1;
 
-    for (int it = 0; it < iterations; it++) {
-      long iterStartNs = System.nanoTime();
-      List<Future<?>> futures = new ArrayList<>();
-      BlobReadSession udsSession = null;
-      if (!"native".equalsIgnoreCase(DRIVER)) {
-        udsSession = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS);
-      }
-      final BlobReadSession sessionToUse = udsSession;
+    log(
+        String.format(
+            "Executing Read50x2x4 Concurrent (driver=%s, mode=%s, sessions=%d, threads=%d)...",
+            DRIVER, wl3Mode, sessionPoolSize, concurrency));
 
-      for (int r = 0; r < 50; r++) {
-        final long offset = r * 4L * 1024 * 1024; // 4MB stride
-        futures.add(executor.submit(() -> {
-          if (sessionToUse != null) {
-            ApiFuture<byte[]> f = sessionToUse.readAs(ReadProjectionConfigs.asFutureBytes().withRangeSpec(RangeSpec.of(offset, 2 * 1024 * 1024)));
-            f.get(120, TimeUnit.SECONDS);
-          } else {
-            try (ReadChannel reader = storage.reader(blobId)) {
-              reader.seek(offset);
-              reader.limit(offset + 2L * 1024 * 1024);
-              ByteBuffer bb = ByteBuffer.allocate(2 * 1024 * 1024);
-              while (bb.hasRemaining()) {
-                if (reader.read(bb) == -1) break;
-              }
-            }
-          }
-          return null;
-        }));
+    ExecutorService executor = Executors.newFixedThreadPool(concurrency);
+    try {
+      if (ENABLE_WARMUP) {
+        runSingleConcurrent50x2x4Pass(blobId, wl3Mode, sessionPoolSize, executor);
       }
-      for (Future<?> f : futures) {
-        f.get();
-      }
-      if (sessionToUse != null) {
-        sessionToUse.close();
-      }
-      long iterElapsedNs = System.nanoTime() - iterStartNs;
-      iterationLatencies.add(iterElapsedNs / 1_000_000.0);
-    }
-    executor.shutdown();
-    Instant wlEnd = Instant.now();
-    recordTimeline("WL3_Read50x2x4_Concurrent", wlStart, wlEnd);
 
-    if (!iterationLatencies.isEmpty()) {
+      WorkloadTelemetrySnapshot snap = beginWorkloadTelemetry();
+      Instant wlStart = Instant.now();
+      long activeTransferNs = 0L;
+      long minDeadlineMs =
+          MIN_WINDOW_SEC > 0 ? (System.currentTimeMillis() + MIN_WINDOW_SEC * 1000L) : 0L;
+      List<Double> iterationLatencies = new ArrayList<Double>(minIterations);
+      long totalBytesAllRuns = 0L;
+
+      while (iterationLatencies.size() < minIterations
+          || System.currentTimeMillis() < minDeadlineMs) {
+        long elapsedNs =
+            runSingleConcurrent50x2x4Pass(blobId, wl3Mode, sessionPoolSize, executor);
+        activeTransferNs += elapsedNs;
+        totalBytesAllRuns += 100L * 1024 * 1024;
+        iterationLatencies.add(elapsedNs / 1_000_000.0);
+      }
+
+      Instant wlEnd = Instant.now();
+      WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
+      recordTimeline("WL3_Read50x2x4_Concurrent_" + wl3Mode, wlStart, wlEnd);
+
       Collections.sort(iterationLatencies);
-      double p50 = iterationLatencies.get((int) (iterationLatencies.size() * 0.50));
-      double p90 = iterationLatencies.get((int) (iterationLatencies.size() * 0.90));
-      double p99 = iterationLatencies.get((int) (iterationLatencies.size() * 0.99));
-      double avgSec = (iterationLatencies.stream().mapToDouble(Double::doubleValue).average().orElse(0.0)) / 1000.0;
-      double throughputMb = avgSec > 0 ? (100.0 / avgSec) : 0.0;
+      double p50 = percentile(iterationLatencies, 0.50);
+      double p90 = percentile(iterationLatencies, 0.90);
+      double p99 = percentile(iterationLatencies, 0.99);
+      double activeSec = activeTransferNs / 1_000_000_000.0;
+      double mbSec = toDecimalMbPerSec(totalBytesAllRuns, activeSec);
+      double mibSec = toBinaryMibPerSec(totalBytesAllRuns, activeSec);
 
-      log(String.format("Read50x2x4 Concurrent Results: %d runs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s",
-          iterationLatencies.size(), p50, p90, p99, throughputMb));
+      log(
+          String.format(
+              "Read50x2x4 Concurrent [%s] Results: %d runs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s (%.2f MiB/s)",
+              wl3Mode, iterationLatencies.size(), p50, p90, p99, mbSec, mibSec));
 
-      BenchmarkMetric metric = new BenchmarkMetric(
-          getTransportPrefix() + "Read50x2x4 Concurrent",
-          100 * 1024 * 1024,
-          concurrency,
-          iterationLatencies.size(),
-          0.0, 0.0, 0.0, 0.0,
-          p50, p90, p99, throughputMb,
-          getUsedHeapMb()
-      );
-      recordedMetrics.add(metric);
+      recordedMetrics.add(
+          new BenchmarkMetric(
+              getTransportPrefix() + "Read50x2x4 Conc (" + wl3Mode + ")",
+              100 * 1024 * 1024,
+              concurrency,
+              iterationLatencies.size(),
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              p50,
+              p90,
+              p99,
+              mbSec,
+              mibSec,
+              getUsedHeapMb(),
+              delta));
+    } finally {
+      executor.shutdown();
+      executor.awaitTermination(30, TimeUnit.SECONDS);
+    }
+  }
+
+  private static long runSingleConcurrent50x2x4Pass(
+      final BlobId blobId, String mode, int sessionPoolSize, ExecutorService executor)
+      throws Exception {
+    // Identical execution path for Native Java, uds-sidecar, and uds-inproc!
+    if (!"reader".equals(mode) && isGrpcTransport()) {
+      final List<BlobReadSession> sessions = new ArrayList<BlobReadSession>(sessionPoolSize);
+      try {
+        for (int s = 0; s < sessionPoolSize; s++) {
+          sessions.add(pickClient(s).blobReadSession(blobId).get(120, TimeUnit.SECONDS));
+        }
+        long startNs = System.nanoTime();
+        List<ApiFuture<byte[]>> rangeFutures = new ArrayList<ApiFuture<byte[]>>(50);
+        for (int r = 0; r < 50; r++) {
+          long offset = r * 4L * 1024 * 1024;
+          BlobReadSession sess = sessions.get(r % sessions.size());
+          rangeFutures.add(
+              sess.readAs(
+                  ReadProjectionConfigs.asFutureBytes()
+                      .withRangeSpec(RangeSpec.of(offset, 2 * 1024 * 1024))));
+        }
+        List<byte[]> results = ApiFutures.allAsList(rangeFutures).get(120, TimeUnit.SECONDS);
+        long elapsedNs = System.nanoTime() - startNs;
+        long total = 0;
+        for (byte[] chunk : results) {
+          total += chunk.length;
+        }
+        Assert.assertEquals(100L * 1024 * 1024, total);
+        return elapsedNs;
+      } finally {
+        for (BlobReadSession s : sessions) {
+          try {
+            s.close();
+          } catch (IOException ignored) {
+          }
+        }
+      }
+    } else {
+      long startNs = System.nanoTime();
+      List<Future<Integer>> futures = new ArrayList<Future<Integer>>(50);
+      for (int r = 0; r < 50; r++) {
+        final int idx = r;
+        final long offset = r * 4L * 1024 * 1024;
+        futures.add(
+            executor.submit(
+                new Callable<Integer>() {
+                  @Override
+                  public Integer call() throws Exception {
+                    ByteBuffer bb = ByteBuffer.allocate(2 * 1024 * 1024);
+                    try (ReadChannel reader = pickClient(idx).reader(blobId)) {
+                      reader.seek(offset);
+                      reader.limit(offset + 2L * 1024 * 1024);
+                      while (bb.hasRemaining()) {
+                        if (reader.read(bb) == -1) {
+                          break;
+                        }
+                      }
+                    }
+                    return bb.position();
+                  }
+                }));
+      }
+      long total = 0;
+      for (Future<Integer> f : futures) {
+        total += f.get(120, TimeUnit.SECONDS);
+      }
+      long elapsedNs = System.nanoTime() - startNs;
+      Assert.assertEquals(100L * 1024 * 1024, total);
+      return elapsedNs;
     }
   }
 
   // =========================================================================
-  // SECTION 0E: WORKLOAD 4 - Random8K (2,000 Random 8 KiB Range Seeks)
+  // WORKLOAD 4 — Random8K (2,000 Random 8 KiB Range Seeks + Dynamic Label)
   // =========================================================================
 
   @Test
   public void test00e_Random8K() throws Exception {
-    banner("WORKLOAD 4: Random8K (Read 2,000 random 8 KiB ranges from open 100 MB object)");
-    String targetObject = System.getProperty("gcs.bench.random.object", "bench-random-100mb.bin");
-    try {
-      Blob b = storage.get(BlobId.of(TEST_BUCKET, targetObject));
-      if (b == null) targetObject = "bench-open-200mb.bin";
-    } catch (Throwable t) {
-      targetObject = "bench-open-200mb.bin";
-    }
-
-    int seekCount = Integer.getInteger("gcs.bench.random8k.count", IS_LIVE ? 500 : 20);
-    log(String.format("Executing %d random 8 KiB seeks against %s/%s ...", seekCount, TEST_BUCKET, targetObject));
+    banner("WORKLOAD 4: Random8K (2,000 random 8 KiB range reads from 100 MB object)");
+    String targetObject =
+        resolveExistingObject(
+            System.getProperty("gcs.bench.random.object", "bench-random-100mb.bin"),
+            "bench-open-200mb.bin");
+    BlobId blobId = BlobId.of(TEST_BUCKET, targetObject);
+    int minSeekCount = Integer.getInteger("gcs.bench.random8k.count", IS_LIVE ? 2000 : 40);
 
     Random rng = new Random(42);
-    long maxOffset = (100L * 1024 * 1024) - (8 * 1024);
-    long[] offsets = new long[seekCount];
-    for (int i = 0; i < seekCount; i++) {
-      offsets[i] = Math.abs(rng.nextLong()) % maxOffset;
+    long maxOffset = (100L * 1024 * 1024) - 8192L;
+    long[] precomputedOffsets = new long[Math.max(minSeekCount, 2000)];
+    for (int i = 0; i < precomputedOffsets.length; i++) {
+      precomputedOffsets[i] = Math.abs(rng.nextLong()) % maxOffset;
     }
 
-    Instant wlStart = Instant.now();
-    List<Double> seekLatencies = new ArrayList<>();
-    BlobId blobId = BlobId.of(TEST_BUCKET, targetObject);
-    BlobReadSession session = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS);
-    long totalStartNs = System.nanoTime();
+    WorkloadTelemetrySnapshot snap;
+    Instant wlStart;
+    long totalStartNs;
+    List<Double> seekLatencies = new ArrayList<Double>(minSeekCount);
 
-    try {
-      for (int i = 0; i < seekCount; i++) {
+    if (isGrpcTransport()) {
+      try (BlobReadSession session = storage.blobReadSession(blobId).get(120, TimeUnit.SECONDS)) {
+        if (ENABLE_WARMUP) {
+          int warmupSeeks = IS_LIVE ? 50 : 5;
+          for (int w = 0; w < warmupSeeks; w++) {
+            session
+                .readAs(
+                    ReadProjectionConfigs.asFutureBytes()
+                        .withRangeSpec(
+                            RangeSpec.of(precomputedOffsets[w % precomputedOffsets.length], 8192)))
+                .get(120, TimeUnit.SECONDS);
+          }
+        }
+
+        snap = beginWorkloadTelemetry();
+        wlStart = Instant.now();
+        totalStartNs = System.nanoTime();
+        long minDeadlineMs =
+            MIN_WINDOW_SEC > 0 ? (System.currentTimeMillis() + MIN_WINDOW_SEC * 1000L) : 0L;
+
+        int i = 0;
+        while (seekLatencies.size() < minSeekCount
+            || System.currentTimeMillis() < minDeadlineMs) {
+          long off = precomputedOffsets[i % precomputedOffsets.length];
+          i++;
+          long opStartNs = System.nanoTime();
+          byte[] data =
+              session
+                  .readAs(
+                      ReadProjectionConfigs.asFutureBytes().withRangeSpec(RangeSpec.of(off, 8192)))
+                  .get(120, TimeUnit.SECONDS);
+          long opElapsedNs = System.nanoTime() - opStartNs;
+          Assert.assertEquals(8192, data.length);
+          seekLatencies.add(opElapsedNs / 1_000_000.0);
+        }
+      }
+    } else {
+      ByteBuffer bb = ByteBuffer.allocate(8192);
+      if (ENABLE_WARMUP) {
+        bb.clear();
+        try (ReadChannel r = storage.reader(blobId)) {
+          r.seek(precomputedOffsets[0]);
+          r.limit(precomputedOffsets[0] + 8192);
+          while (bb.hasRemaining() && r.read(bb) != -1) {}
+        }
+      }
+      snap = beginWorkloadTelemetry();
+      wlStart = Instant.now();
+      totalStartNs = System.nanoTime();
+      long minDeadlineMs =
+          MIN_WINDOW_SEC > 0 ? (System.currentTimeMillis() + MIN_WINDOW_SEC * 1000L) : 0L;
+
+      int i = 0;
+      while (seekLatencies.size() < minSeekCount || System.currentTimeMillis() < minDeadlineMs) {
+        long off = precomputedOffsets[i % precomputedOffsets.length];
+        i++;
+        bb.clear();
         long opStartNs = System.nanoTime();
-        ApiFuture<byte[]> f = session.readAs(ReadProjectionConfigs.asFutureBytes().withRangeSpec(RangeSpec.of(offsets[i], 8192)));
-        f.get(120, TimeUnit.SECONDS);
+        try (ReadChannel r = storage.reader(blobId)) {
+          r.seek(off);
+          r.limit(off + 8192);
+          while (bb.hasRemaining()) {
+            if (r.read(bb) == -1) {
+              break;
+            }
+          }
+        }
         long opElapsedNs = System.nanoTime() - opStartNs;
+        Assert.assertEquals(8192, bb.position());
         seekLatencies.add(opElapsedNs / 1_000_000.0);
       }
-    } catch (Throwable t) {
-      log("Random8K error: " + t.getMessage());
-    } finally {
-      session.close();
     }
 
-    long totalElapsedNs = System.nanoTime() - totalStartNs;
-    double totalSec = totalElapsedNs / 1_000_000_000.0;
+    double totalSec = (System.nanoTime() - totalStartNs) / 1_000_000_000.0;
     Instant wlEnd = Instant.now();
+    WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
     recordTimeline("WL4_Random8K", wlStart, wlEnd);
 
-    if (!seekLatencies.isEmpty()) {
-      Collections.sort(seekLatencies);
-      double p50 = seekLatencies.get((int) (seekLatencies.size() * 0.50));
-      double p90 = seekLatencies.get((int) (seekLatencies.size() * 0.90));
-      double p99 = seekLatencies.get((int) (seekLatencies.size() * 0.99));
-      double opsSec = totalSec > 0 ? (seekLatencies.size() / totalSec) : 0.0;
-      double throughputMb = totalSec > 0 ? ((seekLatencies.size() * 8.0 / 1024.0) / totalSec) : 0.0;
+    Collections.sort(seekLatencies);
+    double p50 = percentile(seekLatencies, 0.50);
+    double p90 = percentile(seekLatencies, 0.90);
+    double p99 = percentile(seekLatencies, 0.99);
+    double opsSec = totalSec > 0 ? (seekLatencies.size() / totalSec) : 0.0;
+    long totalBytes = (long) seekLatencies.size() * 8192L;
 
-      log(String.format("Random8K Results: %d seeks in %.2fs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.1f ops/sec (%.2f MB/s)",
-          seekLatencies.size(), totalSec, p50, p90, p99, opsSec, throughputMb));
+    log(
+        String.format(
+            "Random8K Results: %d seeks in %.2fs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.1f ops/sec (%.2f MB/s / %.2f MiB/s)",
+            seekLatencies.size(),
+            totalSec,
+            p50,
+            p90,
+            p99,
+            opsSec,
+            toDecimalMbPerSec(totalBytes, totalSec),
+            toBinaryMibPerSec(totalBytes, totalSec)));
 
-      BenchmarkMetric metric = new BenchmarkMetric(
-          getTransportPrefix() + "Random8K (2000 seeks)",
-          8 * 1024,
-          1,
-          seekLatencies.size(),
-          0.0, 0.0, 0.0, 0.0,
-          p50, p90, p99, opsSec,
-          getUsedHeapMb()
-      );
-      recordedMetrics.add(metric);
-    }
+    recordedMetrics.add(
+        new BenchmarkMetric(
+            getTransportPrefix() + String.format("Random8K (%d seeks)", seekLatencies.size()),
+            8192,
+            1,
+            seekLatencies.size(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            p50,
+            p90,
+            p99,
+            opsSec,
+            opsSec,
+            getUsedHeapMb(),
+            delta));
   }
 
   // =========================================================================
@@ -856,56 +1109,47 @@ public class ITUdsVeneerBenchmark {
   @Test
   public void test01_VeneerCreateAndReadBytes() throws Exception {
     banner("TEST 01: Veneer create() and readAllBytes() round-trip");
-    String objectName = "veneer-byte-test-" + System.currentTimeMillis() + ".bin";
-    byte[] originalData = new byte[64 * 1024]; // 64 KiB
+    String objectName = "veneer-byte-test-" + System.nanoTime() + ".bin";
+    byte[] originalData = new byte[64 * 1024];
     new Random(42).nextBytes(originalData);
 
     BlobInfo info = BlobInfo.newBuilder(TEST_BUCKET, objectName).build();
-    log("1. Calling storage.create(BlobInfo, byte[64 KiB])...");
     Blob created = storage.create(info, originalData);
-    Assert.assertNotNull("Created blob should not be null", created);
-    log("   Blob created: " + created.getBlobId());
+    Assert.assertNotNull(created);
 
-    log("2. Calling storage.readAllBytes(BlobId)...");
     byte[] downloaded = storage.readAllBytes(created.getBlobId());
-    Assert.assertNotNull("Downloaded bytes should not be null", downloaded);
-    log("   Bit-for-bit download verification PASSED! (" + downloaded.length + " bytes received)");
+    Assert.assertArrayEquals(originalData, downloaded);
 
-    log("3. Calling storage.delete(BlobId)...");
-    boolean deleted = storage.delete(created.getBlobId());
-    Assert.assertTrue("Object should be deleted", deleted);
-    log("   Delete PASSED!");
+    Assert.assertTrue(storage.delete(created.getBlobId()));
+    Assert.assertNull("Deleted blob must return null on get()", storage.get(created.getBlobId()));
   }
 
   @Test
   public void test02_VeneerReadAndWriteChannels() throws Exception {
     banner("TEST 02: Veneer ReadChannel & WriteChannel streaming");
-    String objectName = "veneer-channel-test-" + System.currentTimeMillis() + ".bin";
-    byte[] originalData = new byte[256 * 1024]; // 256 KiB
+    String objectName = "veneer-channel-test-" + System.nanoTime() + ".bin";
+    byte[] originalData = new byte[256 * 1024];
     new Random(99).nextBytes(originalData);
 
     BlobInfo info = BlobInfo.newBuilder(TEST_BUCKET, objectName).build();
-    log("1. Requesting WriteChannel via storage.writer(BlobInfo)...");
     try (WriteChannel writer = storage.writer(info)) {
       ByteBuffer buf = ByteBuffer.wrap(originalData);
       while (buf.hasRemaining()) {
         writer.write(buf);
       }
     }
-    log("   WriteChannel successfully streamed 256 KiB and closed.");
 
-    log("2. Requesting ReadChannel via storage.reader(BlobId)...");
     byte[] readBack = new byte[originalData.length];
     ByteBuffer readBuf = ByteBuffer.wrap(readBack);
     try (ReadChannel reader = storage.reader(info.getBlobId())) {
       while (readBuf.hasRemaining()) {
-        int read = reader.read(readBuf);
-        if (read == -1) break;
+        if (reader.read(readBuf) == -1) {
+          break;
+        }
       }
     }
-    log("   ReadChannel successfully read 256 KiB. Verification PASSED!");
-
-    storage.delete(info.getBlobId());
+    Assert.assertArrayEquals(originalData, readBack);
+    Assert.assertTrue(storage.delete(info.getBlobId()));
   }
 
   @Test
@@ -914,29 +1158,18 @@ public class ITUdsVeneerBenchmark {
     Path srcFile = Files.createTempFile("uds_veneer_upload_", ".dat");
     Path dstFile = Files.createTempFile("uds_veneer_download_", ".dat");
     try {
-      int size = 1024 * 1024; // 1 MiB
-      byte[] payload = new byte[size];
+      byte[] payload = new byte[512 * 1024];
       new Random(1234).nextBytes(payload);
       Files.write(srcFile, payload);
-      log("Created local test file: " + srcFile + " (" + size + " bytes)");
 
-      String objectName = "veneer-file-test-" + System.currentTimeMillis() + ".dat";
-      BlobInfo blobInfo = BlobInfo.newBuilder(TEST_BUCKET, objectName).build();
-
-      log("1. Calling storage.createFrom(BlobInfo, Path)...");
-      Blob created = storage.createFrom(blobInfo, srcFile);
+      String objectName = "veneer-file-test-" + System.nanoTime() + ".dat";
+      Blob created =
+          storage.createFrom(BlobInfo.newBuilder(TEST_BUCKET, objectName).build(), srcFile);
       Assert.assertNotNull(created);
-      log("   File uploaded via createFrom: " + created.getBlobId());
 
-      log("2. Calling storage.downloadTo(BlobId, Path)...");
       storage.downloadTo(created.getBlobId(), dstFile);
-      log("   File downloaded via downloadTo: " + dstFile);
-
-      long downloadedSize = Files.size(dstFile);
-      Assert.assertTrue("Downloaded file must be > 0 bytes", downloadedSize > 0);
-      log("   Download file verification PASSED! (" + downloadedSize + " bytes)");
-
-      storage.delete(created.getBlobId());
+      Assert.assertArrayEquals(payload, Files.readAllBytes(dstFile));
+      Assert.assertTrue(storage.delete(created.getBlobId()));
     } finally {
       Files.deleteIfExists(srcFile);
       Files.deleteIfExists(dstFile);
@@ -945,579 +1178,697 @@ public class ITUdsVeneerBenchmark {
 
   @Test
   public void test04_VeneerListAndGetOperations() throws Exception {
-    banner("TEST 04: Veneer list() and get() operations");
-    String prefix = "list-test-" + System.currentTimeMillis();
+    banner("TEST 04: Veneer list(prefix) and get() operations");
+    String prefix = "list-test-" + System.nanoTime() + "/";
     for (int i = 0; i < 5; i++) {
-      BlobInfo info = BlobInfo.newBuilder(TEST_BUCKET, prefix + "/item-" + i).build();
-      storage.create(info, ("data-" + i).getBytes());
+      BlobInfo info = BlobInfo.newBuilder(TEST_BUCKET, prefix + "item-" + i).build();
+      storage.create(info, ("data-" + i).getBytes(StandardCharsets.UTF_8));
     }
-    log("Created 5 test objects with prefix: " + prefix);
 
-    log("1. Calling storage.list(TEST_BUCKET)...");
-    Page<Blob> page = storage.list(TEST_BUCKET);
-    Assert.assertNotNull(page);
+    Page<Blob> page =
+        storage.list(TEST_BUCKET, BlobListOption.prefix(prefix), BlobListOption.pageSize(10));
     int count = 0;
     for (Blob b : page.getValues()) {
+      Assert.assertTrue(b.getName().startsWith(prefix));
       count++;
     }
-    log("   Found " + count + " items in page.");
-    Assert.assertTrue("Should find items in list", count > 0);
+    Assert.assertEquals(5, count);
 
-    log("2. Calling storage.get(BlobId)...");
-    Blob fetched = storage.get(BlobId.of(TEST_BUCKET, prefix + "/item-0"));
-    log("   get() operation completed (returned: " + fetched + ")");
+    Blob fetched = storage.get(BlobId.of(TEST_BUCKET, prefix + "item-0"));
+    Assert.assertNotNull(fetched);
+    Assert.assertEquals(6L, fetched.getSize().longValue());
 
-    log("3. Calling storage.list() for buckets...");
-    Page<Bucket> buckets = storage.list();
-    Assert.assertNotNull(buckets);
-    log("   List buckets returned page successfully.");
-
-    // Cleanup
     for (int i = 0; i < 5; i++) {
-      storage.delete(BlobId.of(TEST_BUCKET, prefix + "/item-" + i));
+      Assert.assertTrue(storage.delete(BlobId.of(TEST_BUCKET, prefix + "item-" + i)));
     }
   }
 
   // =========================================================================
-  // SECTION 2: W1R3 WORKLOAD ACROSS SIZES & CONCURRENCY
-  // =========================================================================
-
-  @Test
-  public void test05_W1R3Benchmark_1KiB() throws Exception {
-    int iters = Integer.getInteger("gcs.bench.iterations.small", 8);
-    int conc = Integer.getInteger("gcs.bench.concurrency.small", 16);
-    runW1R3Workload("1 KiB", 1024, iters, conc);
-  }
-
-  @Test
-  public void test06_W1R3Benchmark_100KiB() throws Exception {
-    int iters = Integer.getInteger("gcs.bench.iterations.small", 8);
-    int conc = Integer.getInteger("gcs.bench.concurrency.small", 16);
-    runW1R3Workload("100 KiB", 100 * 1024, iters, conc);
-  }
-
-  @Test
-  public void test07_W1R3Benchmark_16MiB() throws Exception {
-    int iters = Integer.getInteger("gcs.bench.iterations.16m", 4);
-    int conc = Integer.getInteger("gcs.bench.concurrency.16m", 8);
-    runW1R3Workload("16 MiB", 16 * 1024 * 1024, iters, conc);
-  }
-
-  @Test
-  public void test08_W1R3Benchmark_200MiB() throws Exception {
-    // 200 MiB payload - exact requirement from Google Doc tab t.rn625s1tqaw2
-    int iters = Integer.getInteger("gcs.bench.iterations.200m", 2);
-    int conc = Integer.getInteger("gcs.bench.concurrency.200m", 1);
-    runW1R3Workload("200 MiB", 200 * 1024 * 1024, iters, conc);
-  }
-
-  // =========================================================================
-  // SECTION 3: LIST BUCKET & LIST OBJECT FOR 100 ITEMS
+  // WORKLOAD 7a & 7b — ListObjects (100 Items) & ListBuckets (100 Items)
   // =========================================================================
 
   @Test
   public void test09a_ListObjects100Benchmark() throws Exception {
-    banner("WORKLOAD 7a: ListObjects (100 Items)");
-    int listIters = Integer.getInteger("gcs.bench.list.iterations", IS_LIVE ? 20 : 2);
-    log(String.format("Executing %d listing iterations against 100 items in bucket: %s", listIters, TEST_BUCKET));
+    banner("WORKLOAD 7a: ListObjects (100 Items under isolated prefix)");
+    String listPrefix = System.getProperty("gcs.bench.list.prefix", "list-bench-100/");
+    int minIters = Integer.getInteger("gcs.bench.list.iterations", IS_LIVE ? 50 : 5);
 
+    if (ENABLE_WARMUP) {
+      int warmup = IS_LIVE ? 5 : 1;
+      for (int w = 0; w < warmup; w++) {
+        Page<Blob> p =
+            storage.list(
+                TEST_BUCKET, BlobListOption.prefix(listPrefix), BlobListOption.pageSize(100));
+        for (Blob ignored : p.getValues()) {}
+      }
+    }
+
+    WorkloadTelemetrySnapshot snap = beginWorkloadTelemetry();
     Instant objStart = Instant.now();
-    List<Double> listLatencies = new ArrayList<>();
-    for (int i = 0; i < listIters; i++) {
+    long startTotalNs = System.nanoTime();
+    long minDeadlineMs =
+        MIN_WINDOW_SEC > 0 ? (System.currentTimeMillis() + MIN_WINDOW_SEC * 1000L) : 0L;
+    List<Double> listLatencies = new ArrayList<Double>(minIters);
+    int lastCount = 0;
+
+    while (listLatencies.size() < minIters || System.currentTimeMillis() < minDeadlineMs) {
       long start = System.nanoTime();
-      Page<Blob> page = storage.list(TEST_BUCKET);
+      Page<Blob> page =
+          storage.list(
+              TEST_BUCKET, BlobListOption.prefix(listPrefix), BlobListOption.pageSize(100));
       int count = 0;
-      for (Blob b : page.getValues()) {
+      for (Blob ignored : page.getValues()) {
         count++;
       }
       long elapsedNs = System.nanoTime() - start;
+      lastCount = count;
       listLatencies.add(elapsedNs / 1_000_000.0);
     }
+
+    double totalSec = (System.nanoTime() - startTotalNs) / 1_000_000_000.0;
     Instant objEnd = Instant.now();
+    WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
     recordTimeline("WL7a_ListObjects_100", objStart, objEnd);
 
+    if (!IS_LIVE || Boolean.parseBoolean(System.getProperty("gcs.bench.strict.list100", "false"))) {
+      Assert.assertEquals("Expected 100 objects under " + listPrefix, 100, lastCount);
+    }
+
     Collections.sort(listLatencies);
-    double p50 = listLatencies.get((int) (listLatencies.size() * 0.50));
-    double p90 = listLatencies.get((int) (listLatencies.size() * 0.90));
-    double p99 = listLatencies.get((int) (listLatencies.size() * 0.99));
-    double avg = listLatencies.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+    double p50 = percentile(listLatencies, 0.50);
+    double p90 = percentile(listLatencies, 0.90);
+    double p99 = percentile(listLatencies, 0.99);
+    double opsSec = totalSec > 0 ? (listLatencies.size() / totalSec) : 0.0;
 
-    log(String.format("ListObjects (100 items) results across %d runs:", listIters));
-    log(String.format("  P50 Latency: %.2f ms", p50));
-    log(String.format("  P90 Latency: %.2f ms", p90));
-    log(String.format("  P99 Latency: %.2f ms", p99));
-    log(String.format("  Avg Latency: %.2f ms (%.1f ops/sec)", avg, avg > 0 ? 1000.0 / avg : 0));
+    log(
+        String.format(
+            "ListObjects (%d items) across %d runs: P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.1f ops/sec",
+            lastCount, listLatencies.size(), p50, p90, p99, opsSec));
 
-    BenchmarkMetric metric = new BenchmarkMetric(
-        getTransportPrefix() + "ListObjects (100 items)",
-        100,
-        1,
-        listIters,
-        p50, p90, p99, 0.0,
-        p50, p90, p99, avg > 0 ? 1000.0 / avg : 0.0,
-        getUsedHeapMb()
-    );
-    recordedMetrics.add(metric);
-  }
-
-  public void test09_List100ItemsBenchmark() throws Exception {
-    test09a_ListObjects100Benchmark();
-    test09b_ListBucketsBenchmark();
+    recordedMetrics.add(
+        new BenchmarkMetric(
+            getTransportPrefix() + "ListObjects (" + lastCount + " items)",
+            lastCount,
+            1,
+            listLatencies.size(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            p50,
+            p90,
+            p99,
+            opsSec,
+            opsSec,
+            getUsedHeapMb(),
+            delta));
   }
 
   @Test
   public void test09b_ListBucketsBenchmark() throws Exception {
-    banner("WORKLOAD 7b: ListBuckets (Project-scoped)");
-    int listIters = Integer.getInteger("gcs.bench.list.iterations", IS_LIVE ? 20 : 2);
-    log(String.format("Executing %d ListBuckets iterations (project-scoped)...", listIters));
+    banner("WORKLOAD 7b: ListBuckets (pageSize=100)");
+    int minIters = Integer.getInteger("gcs.bench.list.iterations", IS_LIVE ? 50 : 5);
+
+    if (ENABLE_WARMUP) {
+      int warmup = IS_LIVE ? 5 : 1;
+      for (int w = 0; w < warmup; w++) {
+        Page<Bucket> p = storage.list(BucketListOption.pageSize(100));
+        for (Bucket ignored : p.getValues()) {}
+      }
+    }
+
+    WorkloadTelemetrySnapshot snap = beginWorkloadTelemetry();
     Instant bktStart = Instant.now();
-    List<Double> bucketLatencies = new ArrayList<>();
-    for (int i = 0; i < listIters; i++) {
+    long startTotalNs = System.nanoTime();
+    long minDeadlineMs =
+        MIN_WINDOW_SEC > 0 ? (System.currentTimeMillis() + MIN_WINDOW_SEC * 1000L) : 0L;
+    List<Double> bucketLatencies = new ArrayList<Double>(minIters);
+    int lastCount = 0;
+
+    while (bucketLatencies.size() < minIters || System.currentTimeMillis() < minDeadlineMs) {
       long start = System.nanoTime();
-      try {
-        Page<Bucket> page = storage.list();
-        int count = 0;
-        for (Bucket b : page.getValues()) {
-          count++;
-        }
-      } catch (Throwable t) {
-        log("ListBuckets error: " + t.getMessage());
-        break;
+      Page<Bucket> page = storage.list(BucketListOption.pageSize(100));
+      int count = 0;
+      for (Bucket ignored : page.getValues()) {
+        count++;
       }
       long elapsedNs = System.nanoTime() - start;
+      lastCount = count;
       bucketLatencies.add(elapsedNs / 1_000_000.0);
     }
+
+    double totalSec = (System.nanoTime() - startTotalNs) / 1_000_000_000.0;
     Instant bktEnd = Instant.now();
+    WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
     recordTimeline("WL7b_ListBuckets", bktStart, bktEnd);
 
-    if (!bucketLatencies.isEmpty()) {
-      Collections.sort(bucketLatencies);
-      double bp50 = bucketLatencies.get((int) (bucketLatencies.size() * 0.50));
-      double bp90 = bucketLatencies.get((int) (bucketLatencies.size() * 0.90));
-      double bp99 = bucketLatencies.get((int) (bucketLatencies.size() * 0.99));
-      double bavg = bucketLatencies.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-      double bopsSec = bavg > 0 ? 1000.0 / bavg : 0.0;
-
-      log(String.format("ListBuckets results across %d runs:", listIters));
-      log(String.format("  P50 Latency: %.2f ms | P90: %.2f ms | P99: %.2f ms | %.1f ops/sec", bp50, bp90, bp99, bopsSec));
-
-      recordedMetrics.add(new BenchmarkMetric(
-          getTransportPrefix() + "ListBucket",
-          100,
-          1,
-          bucketLatencies.size(),
-          bp50, bp90, bp99, 0.0,
-          bp50, bp90, bp99, bopsSec,
-          getUsedHeapMb()
-      ));
+    if (!IS_LIVE) {
+      Assert.assertEquals(100, lastCount);
     }
+
+    Collections.sort(bucketLatencies);
+    double p50 = percentile(bucketLatencies, 0.50);
+    double p90 = percentile(bucketLatencies, 0.90);
+    double p99 = percentile(bucketLatencies, 0.99);
+    double opsSec = totalSec > 0 ? (bucketLatencies.size() / totalSec) : 0.0;
+
+    log(
+        String.format(
+            "ListBuckets (%d buckets) across %d runs: P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.1f ops/sec",
+            lastCount, bucketLatencies.size(), p50, p90, p99, opsSec));
+
+    recordedMetrics.add(
+        new BenchmarkMetric(
+            getTransportPrefix() + "ListBuckets (" + lastCount + " items)",
+            lastCount,
+            1,
+            bucketLatencies.size(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            p50,
+            p90,
+            p99,
+            opsSec,
+            opsSec,
+            getUsedHeapMb(),
+            delta));
   }
 
   // =========================================================================
-  // SECTION 4: CLOUDPATH 48-WORKER RAPID WORKLOADS (Doc Tab t.rn625s1tqaw2)
+  // WORKLOAD 5 — Read 16 MiB Chunks of 200 MiB (48 Workers, 5 Mins Live)
   // =========================================================================
 
   @Test
   public void test10_CloudpathWorkload4_Read16MbChunkOf200Mb() throws Exception {
-    banner("TEST 10: Cloudpath Workload 4 (Read 16 MB chunks of 200 MB via 48 parallel workers)");
-    int defaultConcurrency = IS_LIVE ? 48 : 2;
-    int defaultIterations = IS_LIVE ? 2 : 1;
-    int concurrency = Integer.getInteger("gcs.bench.workload4.concurrency", defaultConcurrency);
-    int durationSec = Integer.getInteger("gcs.bench.duration.sec", 0);
-    int iterations = Integer.getInteger("gcs.bench.workload4.iterations", defaultIterations);
-
+    int concurrency = Integer.getInteger("gcs.bench.workload4.concurrency", IS_LIVE ? 48 : 2);
+    int durationSec = Integer.getInteger("gcs.bench.duration.sec", IS_LIVE ? 300 : 0);
+    int iterations = Integer.getInteger("gcs.bench.workload4.iterations", IS_LIVE ? 4 : 2);
     runRead16MbChunksWorkload(concurrency, durationSec, iterations);
   }
 
+  private void runRead16MbChunksWorkload(
+      final int concurrency, final int durationSec, final int iterations) throws Exception {
+    final String apiMode =
+        System.getProperty("gcs.bench.wl5.api", isGrpcTransport() ? "bidi" : "reader")
+            .trim()
+            .toLowerCase();
+    banner(
+        String.format(
+            "WORKLOAD 5: Read 16 MiB chunks of 200 MiB (%d workers, duration=%ds, api=%s)",
+            concurrency, durationSec, apiMode));
+
+    ExecutorService executor = Executors.newFixedThreadPool(concurrency);
+    try {
+      // Optional steady-state warmup before measurement window
+      if (ENABLE_WARMUP) {
+        int warmupSec = Integer.getInteger("gcs.bench.wl5.warmup.sec", IS_LIVE ? 15 : 0);
+        if (warmupSec > 0) {
+          log("Running " + warmupSec + "s unrecorded warmup on " + concurrency + " workers...");
+          executeRead16MbWorkers(executor, concurrency, warmupSec, 1, apiMode, null, null, null);
+        } else {
+          executeRead16MbWorkers(executor, Math.min(2, concurrency), 0, 1, apiMode, null, null, null);
+        }
+      }
+
+      WorkloadTelemetrySnapshot snap = beginWorkloadTelemetry();
+      Instant wlStart = Instant.now();
+      List<Double> readLatencies = Collections.synchronizedList(new ArrayList<Double>());
+      AtomicLong totalBytes = new AtomicLong(0L);
+      AtomicInteger totalOps = new AtomicInteger(0);
+
+      long startNs = System.nanoTime();
+      executeRead16MbWorkers(
+          executor,
+          concurrency,
+          durationSec,
+          iterations,
+          apiMode,
+          readLatencies,
+          totalBytes,
+          totalOps);
+      double totalSec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+
+      Instant wlEnd = Instant.now();
+      WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
+      recordTimeline("WL5_Read16Mb_Workers48_" + apiMode, wlStart, wlEnd);
+
+      Assert.assertFalse("Expected completed 16 MiB chunk reads in WL5", readLatencies.isEmpty());
+      Collections.sort(readLatencies);
+      double p50 = percentile(readLatencies, 0.50);
+      double p90 = percentile(readLatencies, 0.90);
+      double p99 = percentile(readLatencies, 0.99);
+      double mbSec = toDecimalMbPerSec(totalBytes.get(), totalSec);
+      double mibSec = toBinaryMibPerSec(totalBytes.get(), totalSec);
+
+      log(
+          String.format(
+              "WL5 (Read 16MB/%s) Results: %d ops in %.2fs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s (%.2f MiB/s)",
+              apiMode, totalOps.get(), totalSec, p50, p90, p99, mbSec, mibSec));
+
+      recordedMetrics.add(
+          new BenchmarkMetric(
+              getTransportPrefix() + "WL5 Read 16MB (" + apiMode + ")",
+              16 * 1024 * 1024,
+              concurrency,
+              totalOps.get(),
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              p50,
+              p90,
+              p99,
+              mbSec,
+              mibSec,
+              getUsedHeapMb(),
+              delta));
+    } finally {
+      executor.shutdown();
+      executor.awaitTermination(60, TimeUnit.SECONDS);
+    }
+  }
+
+  private static void executeRead16MbWorkers(
+      ExecutorService executor,
+      int concurrency,
+      final int durationSec,
+      final int iterations,
+      final String apiMode,
+      final List<Double> latenciesOut,
+      final AtomicLong bytesOut,
+      final AtomicInteger opsOut)
+      throws Exception {
+    final long chunkLen = 16L * 1024 * 1024;
+    final int chunksPerObject = 12; // 12 * 16 MiB = 192 MiB <= 200 MiB
+    final long deadlineMs =
+        durationSec > 0 ? (System.currentTimeMillis() + durationSec * 1000L) : Long.MAX_VALUE;
+
+    List<Future<?>> futures = new ArrayList<Future<?>>(concurrency);
+    for (int w = 0; w < concurrency; w++) {
+      final int workerId = w;
+      futures.add(
+          executor.submit(
+              new Callable<Void>() {
+                @Override
+                public Void call() throws Exception {
+                  Storage client = pickClient(workerId);
+                  BlobId blobId =
+                      BlobId.of(TEST_BUCKET, String.format("bench-200mb-%d.bin", workerId % 48));
+                  if ("bidi".equals(apiMode) && isGrpcTransport()) {
+                    try (BlobReadSession session =
+                        client.blobReadSession(blobId).get(120, TimeUnit.SECONDS)) {
+                      int count = 0;
+                      while ((durationSec > 0 && System.currentTimeMillis() < deadlineMs)
+                          || (durationSec == 0 && count < iterations)) {
+                        long offset = (count % chunksPerObject) * chunkLen;
+                        count++;
+                        long opStart = System.nanoTime();
+                        byte[] bytes =
+                            session
+                                .readAs(
+                                    ReadProjectionConfigs.asFutureBytes()
+                                        .withRangeSpec(RangeSpec.of(offset, chunkLen)))
+                                .get(120, TimeUnit.SECONDS);
+                        long opNs = System.nanoTime() - opStart;
+                        if (latenciesOut != null && bytes.length > 0) {
+                          latenciesOut.add(opNs / 1_000_000.0);
+                          bytesOut.addAndGet(bytes.length);
+                          opsOut.incrementAndGet();
+                        }
+                      }
+                    }
+                  } else {
+                    ByteBuffer buf = ByteBuffer.allocate((int) chunkLen);
+                    int count = 0;
+                    while ((durationSec > 0 && System.currentTimeMillis() < deadlineMs)
+                        || (durationSec == 0 && count < iterations)) {
+                      long offset = (count % chunksPerObject) * chunkLen;
+                      count++;
+                      buf.clear();
+                      long opStart = System.nanoTime();
+                      try (ReadChannel reader = client.reader(blobId)) {
+                        reader.seek(offset);
+                        // Explicit range limit prevents unbounded 200 MiB full-object streaming!
+                        reader.limit(offset + chunkLen);
+                        while (buf.hasRemaining()) {
+                          if (reader.read(buf) == -1) {
+                            break;
+                          }
+                        }
+                      }
+                      long opNs = System.nanoTime() - opStart;
+                      if (latenciesOut != null && buf.position() > 0) {
+                        latenciesOut.add(opNs / 1_000_000.0);
+                        bytesOut.addAndGet(buf.position());
+                        opsOut.incrementAndGet();
+                      }
+                    }
+                  }
+                  return null;
+                }
+              }));
+    }
+    for (Future<?> f : futures) {
+      f.get();
+    }
+  }
+
+  // =========================================================================
+  // WORKLOAD 6 — Write 200 MiB Objects (48 Workers, 5 Mins Live, Zonal Enabled)
+  // =========================================================================
+
   @Test
   public void test11_CloudpathWorkload5_Write200Mb() throws Exception {
-    banner("TEST 11: Cloudpath Workload 5 (Write 200 MB objects via 48 parallel workers)");
-    if (TEST_BUCKET.contains("zonal")) {
-      log("Skipping Workload 5 Write 200MB for Zonal bucket (Resumable upload not supported on zonal buckets)");
-      recordedMetrics.add(new BenchmarkMetric(
-          getTransportPrefix() + "WL5 Write 200MB (48 workers)",
-          200 * 1024 * 1024,
-          48,
-          0,
-          0.0, 0.0, 0.0, 0.0,
-          0.0, 0.0, 0.0, 0.0,
-          getUsedHeapMb()
-      ));
-      return;
-    }
-    int defaultConcurrency = IS_LIVE ? 48 : 2;
-    int defaultIterations = IS_LIVE ? 2 : 1;
-    int concurrency = Integer.getInteger("gcs.bench.workload5.concurrency", defaultConcurrency);
-    int durationSec = Integer.getInteger("gcs.bench.duration.sec", 0);
-    int iterations = Integer.getInteger("gcs.bench.workload5.iterations", defaultIterations);
-
+    int concurrency = Integer.getInteger("gcs.bench.workload5.concurrency", IS_LIVE ? 48 : 2);
+    int durationSec = Integer.getInteger("gcs.bench.duration.sec", IS_LIVE ? 300 : 0);
+    int iterations = Integer.getInteger("gcs.bench.workload5.iterations", IS_LIVE ? 2 : 1);
     runWrite200MbWorkload(concurrency, durationSec, iterations);
   }
 
-  // =========================================================================
-  // HELPER BENCHMARK WORKLOAD RUNNERS
-  // =========================================================================
+  private void runWrite200MbWorkload(
+      final int concurrency, final int durationSec, final int iterations) throws Exception {
+    // Use BidiWriteObject (blobAppendableUpload) by default on gRPC/Zonal, or writer() on JSON/Regional.
+    String defaultWriteApi =
+        (isGrpcTransport() && (!IS_LIVE || TEST_BUCKET.contains("zonal")))
+            ? "appendable"
+            : (isGrpcTransport() ? "writer" : "writer");
+    final String writeApi =
+        System.getProperty("gcs.bench.wl6.api", defaultWriteApi).trim().toLowerCase();
+    final long targetSize = IS_LIVE ? (200L * 1024 * 1024) : (4L * 1024 * 1024);
 
-  private void runRead16MbChunksWorkload(int concurrency, int durationSec, int iterations) throws Exception {
-    banner(String.format("WORKLOAD 4: Read 16 MB chunks (%d workers, duration=%ds, fallback_iters=%d)",
-        concurrency, durationSec, iterations));
+    banner(
+        String.format(
+            "WORKLOAD 6: Write %,d MiB objects (%d workers, duration=%ds, api=%s)",
+            targetSize / (1024 * 1024), concurrency, durationSec, writeApi));
 
-    Instant wlStart = Instant.now();
+    final byte[] reusableChunk = new byte[4 * 1024 * 1024];
+    new Random(42).nextBytes(reusableChunk);
+    final Queue<BlobId> objectsToCleanup = new ConcurrentLinkedQueue<BlobId>();
+
     ExecutorService executor = Executors.newFixedThreadPool(concurrency);
-    List<Double> readLatencies = Collections.synchronizedList(new ArrayList<>());
-    AtomicLong totalBytesTransferred = new AtomicLong();
-    AtomicInteger totalOperations = new AtomicInteger();
+    try {
+      if (ENABLE_WARMUP) {
+        int warmupSec = Integer.getInteger("gcs.bench.wl6.warmup.sec", IS_LIVE ? 15 : 0);
+        if (warmupSec > 0) {
+          log("Running " + warmupSec + "s unrecorded write warmup...");
+          executeWriteWorkers(
+              executor,
+              concurrency,
+              warmupSec,
+              1,
+              targetSize,
+              writeApi,
+              reusableChunk,
+              objectsToCleanup,
+              null,
+              null,
+              null);
+        } else {
+          executeWriteWorkers(
+              executor,
+              Math.min(2, concurrency),
+              0,
+              1,
+              targetSize,
+              writeApi,
+              reusableChunk,
+              objectsToCleanup,
+              null,
+              null,
+              null);
+        }
+      }
 
-    long startTotalNs = System.nanoTime();
-    long deadlineMs = (durationSec > 0) ? (System.currentTimeMillis() + durationSec * 1000L) : Long.MAX_VALUE;
+      WorkloadTelemetrySnapshot snap = beginWorkloadTelemetry();
+      Instant wlStart = Instant.now();
+      List<Double> writeLatencies = Collections.synchronizedList(new ArrayList<Double>());
+      AtomicLong totalBytes = new AtomicLong(0L);
+      AtomicInteger totalOps = new AtomicInteger(0);
 
-    List<Future<?>> futures = new ArrayList<>();
+      long startNs = System.nanoTime();
+      executeWriteWorkers(
+          executor,
+          concurrency,
+          durationSec,
+          iterations,
+          targetSize,
+          writeApi,
+          reusableChunk,
+          objectsToCleanup,
+          writeLatencies,
+          totalBytes,
+          totalOps);
+      double totalSec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+
+      Instant wlEnd = Instant.now();
+      WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
+      recordTimeline("WL6_Write200Mb_Workers48_" + writeApi, wlStart, wlEnd);
+
+      // Post-workload cleanup strictly OUTSIDE [wlStart, wlEnd] and [startNs, totalSec]!
+      cleanupCreatedObjects(executor, objectsToCleanup);
+
+      Assert.assertFalse("Expected completed writes in WL6", writeLatencies.isEmpty());
+      Collections.sort(writeLatencies);
+      double p50 = percentile(writeLatencies, 0.50);
+      double p90 = percentile(writeLatencies, 0.90);
+      double p99 = percentile(writeLatencies, 0.99);
+      double mbSec = toDecimalMbPerSec(totalBytes.get(), totalSec);
+      double mibSec = toBinaryMibPerSec(totalBytes.get(), totalSec);
+
+      log(
+          String.format(
+              "WL6 (Write/%s) Results: %d ops in %.2fs | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s (%.2f MiB/s)",
+              writeApi, totalOps.get(), totalSec, p50, p90, p99, mbSec, mibSec));
+
+      recordedMetrics.add(
+          new BenchmarkMetric(
+              getTransportPrefix() + "WL6 Write 200MB (" + writeApi + ")",
+              (int) targetSize,
+              concurrency,
+              totalOps.get(),
+              p50,
+              p90,
+              p99,
+              mbSec,
+              mibSec,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              getUsedHeapMb(),
+              delta));
+    } finally {
+      executor.shutdown();
+      executor.awaitTermination(60, TimeUnit.SECONDS);
+    }
+  }
+
+  private static void executeWriteWorkers(
+      ExecutorService executor,
+      int concurrency,
+      final int durationSec,
+      final int iterations,
+      final long targetSize,
+      final String writeApi,
+      final byte[] chunk,
+      final Queue<BlobId> cleanupQueue,
+      final List<Double> latenciesOut,
+      final AtomicLong bytesOut,
+      final AtomicInteger opsOut)
+      throws Exception {
+    final long deadlineMs =
+        durationSec > 0 ? (System.currentTimeMillis() + durationSec * 1000L) : Long.MAX_VALUE;
+    final BlobAppendableUploadConfig appendConfig =
+        BlobAppendableUploadConfig.of().withCloseAction(CloseAction.FINALIZE_WHEN_CLOSING);
+
+    List<Future<?>> futures = new ArrayList<Future<?>>(concurrency);
     for (int w = 0; w < concurrency; w++) {
       final int workerId = w;
-      futures.add(executor.submit(() -> {
-        byte[] buffer = new byte[16 * 1024 * 1024]; // 16 MiB chunk buffer
-        ByteBuffer byteBuffer = ByteBuffer.wrap(buffer);
-        String targetObject = String.format("bench-200mb-%d.bin", workerId % 48);
+      futures.add(
+          executor.submit(
+              new Callable<Void>() {
+                @Override
+                public Void call() throws Exception {
+                  Storage client = pickClient(workerId);
+                  int count = 0;
+                  while ((durationSec > 0 && System.currentTimeMillis() < deadlineMs)
+                      || (durationSec == 0 && count < iterations)) {
+                    count++;
+                    String objName =
+                        String.format(
+                            "bench-write-w%d-%d-%d.bin", workerId, count, System.nanoTime());
+                    BlobInfo info = BlobInfo.newBuilder(TEST_BUCKET, objName).build();
 
-        int count = 0;
-        while ((durationSec > 0 && System.currentTimeMillis() < deadlineMs)
-            || (durationSec == 0 && count < iterations)) {
-          count++;
-          byteBuffer.clear();
-          long opStartNs = System.nanoTime();
-          try (ReadChannel reader = storage.reader(TEST_BUCKET, targetObject)) {
-            while (byteBuffer.hasRemaining()) {
-              int r = reader.read(byteBuffer);
-              if (r == -1) break;
-            }
-          } catch (Throwable t) {
-            log(String.format("Worker-%d read error on %s: %s", workerId, targetObject, t.getMessage()));
-            break;
-          }
-          long opElapsedNs = System.nanoTime() - opStartNs;
-          int bytesRead = byteBuffer.position();
-          if (bytesRead > 0) {
-            readLatencies.add(opElapsedNs / 1_000_000.0);
-            totalBytesTransferred.addAndGet(bytesRead);
-            totalOperations.incrementAndGet();
-          }
-        }
-      }));
+                    long opStart = System.nanoTime();
+                    if ("appendable".equals(writeApi)) {
+                      BlobAppendableUpload upload =
+                          client.blobAppendableUpload(info, appendConfig);
+                      try (AppendableUploadWriteableByteChannel ch = upload.open()) {
+                        long remaining = targetSize;
+                        while (remaining > 0) {
+                          int toWrite = (int) Math.min(chunk.length, remaining);
+                          ByteBuffer buf = ByteBuffer.wrap(chunk, 0, toWrite);
+                          while (buf.hasRemaining()) {
+                            int n = ch.write(buf);
+                            if (n == 0) {
+                              Thread.yield();
+                            }
+                          }
+                          remaining -= toWrite;
+                        }
+                        ch.finalizeAndClose();
+                      }
+                      BlobInfo created = upload.getResult().get(300, TimeUnit.SECONDS);
+                      cleanupQueue.offer(created.getBlobId());
+                    } else {
+                      try (WriteChannel writer = client.writer(info)) {
+                        long remaining = targetSize;
+                        while (remaining > 0) {
+                          int toWrite = (int) Math.min(chunk.length, remaining);
+                          ByteBuffer buf = ByteBuffer.wrap(chunk, 0, toWrite);
+                          while (buf.hasRemaining()) {
+                            writer.write(buf);
+                          }
+                          remaining -= toWrite;
+                        }
+                      }
+                      cleanupQueue.offer(info.getBlobId());
+                    }
+                    long opNs = System.nanoTime() - opStart;
+                    if (latenciesOut != null) {
+                      latenciesOut.add(opNs / 1_000_000.0);
+                      bytesOut.addAndGet(targetSize);
+                      opsOut.incrementAndGet();
+                    }
+                  }
+                  return null;
+                }
+              }));
     }
-
     for (Future<?> f : futures) {
       f.get();
     }
-    executor.shutdown();
-    executor.awaitTermination(60, TimeUnit.SECONDS);
-
-    double totalSec = (System.nanoTime() - startTotalNs) / 1_000_000_000.0;
-    if (readLatencies.isEmpty()) {
-      log("Warning: No read operations completed in Workload 4.");
-      return;
-    }
-
-    Collections.sort(readLatencies);
-    double p50 = readLatencies.get((int) (readLatencies.size() * 0.50));
-    double p90 = readLatencies.get((int) (readLatencies.size() * 0.90));
-    double p99 = readLatencies.get((int) (readLatencies.size() * 0.99));
-    double throughputMb = (totalBytesTransferred.get() / 1024.0 / 1024.0) / totalSec;
-
-    log(String.format("Workload 4 (Read 16MB) Results: Total=%d ops in %.2f s | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s",
-        totalOperations.get(), totalSec, p50, p90, p99, throughputMb));
-
-    recordedMetrics.add(new BenchmarkMetric(
-        getTransportPrefix() + "WL4 Read 16MB/200MB",
-        16 * 1024 * 1024,
-        concurrency,
-        totalOperations.get(),
-        0.0, 0.0, 0.0, 0.0,
-        p50, p90, p99, throughputMb,
-        getUsedHeapMb()
-    ));
-    Instant wlEnd = Instant.now();
-    recordTimeline("WL5_Read16Mb_Workers48", wlStart, wlEnd);
   }
 
-  private void runWrite200MbWorkload(int concurrency, int durationSec, int iterations) throws Exception {
-    banner(String.format("WORKLOAD 5: Write 200 MB objects (%d workers, duration=%ds, fallback_iters=%d)",
-        concurrency, durationSec, iterations));
-
-    Instant wlStart = Instant.now();
-    ExecutorService executor = Executors.newFixedThreadPool(concurrency);
-    List<Double> writeLatencies = Collections.synchronizedList(new ArrayList<>());
-    AtomicLong totalBytesTransferred = new AtomicLong();
-    AtomicInteger totalOperations = new AtomicInteger();
-
-    long startTotalNs = System.nanoTime();
-    long deadlineMs = (durationSec > 0) ? (System.currentTimeMillis() + durationSec * 1000L) : Long.MAX_VALUE;
-
-    // 16 MiB chunk buffer reused for writing 200 MiB (12 x 16 MiB + 8 MiB = 200 MiB)
-    byte[] chunk = new byte[16 * 1024 * 1024];
-    new Random(42).nextBytes(chunk);
-
-    List<Future<?>> futures = new ArrayList<>();
-    for (int w = 0; w < concurrency; w++) {
-      final int workerId = w;
-      futures.add(executor.submit(() -> {
-        int count = 0;
-        long targetSize = IS_LIVE ? (200L * 1024 * 1024) : (16L * 1024 * 1024);
-        while ((durationSec > 0 && System.currentTimeMillis() < deadlineMs)
-            || (durationSec == 0 && count < iterations)) {
-          count++;
-          String objName = String.format("bench-write-200mb-w%d-%d-%d.bin", workerId, count, System.nanoTime());
-          BlobInfo info = BlobInfo.newBuilder(TEST_BUCKET, objName).build();
-
-          long opStartNs = System.nanoTime();
-          try (WriteChannel writer = storage.writer(info)) {
-            long remaining = targetSize;
-            while (remaining > 0) {
-              int toWrite = (int) Math.min(chunk.length, remaining);
-              ByteBuffer buf = ByteBuffer.wrap(chunk, 0, toWrite);
-              while (buf.hasRemaining()) {
-                writer.write(buf);
-              }
-              remaining -= toWrite;
-            }
-          } catch (Throwable t) {
-            log(String.format("Worker-%d write error on %s: %s", workerId, objName, t.getMessage()));
-            break;
-          }
-          long opElapsedNs = System.nanoTime() - opStartNs;
-          writeLatencies.add(opElapsedNs / 1_000_000.0);
-          totalBytesTransferred.addAndGet(targetSize);
-          totalOperations.incrementAndGet();
-
-          // Cleanup written object
-          try {
-            storage.delete(info.getBlobId());
-          } catch (Throwable ignored) {}
-        }
-      }));
-    }
-
-    for (Future<?> f : futures) {
-      f.get();
-    }
-    executor.shutdown();
-    executor.awaitTermination(60, TimeUnit.SECONDS);
-
-    double totalSec = (System.nanoTime() - startTotalNs) / 1_000_000_000.0;
-    if (writeLatencies.isEmpty()) {
-      log("Warning: No write operations completed in Workload 5.");
+  private static void cleanupCreatedObjects(
+      ExecutorService executor, final Queue<BlobId> cleanupQueue) throws Exception {
+    int count = cleanupQueue.size();
+    if (count == 0) {
       return;
     }
-
-    Collections.sort(writeLatencies);
-    double p50 = writeLatencies.get((int) (writeLatencies.size() * 0.50));
-    double p90 = writeLatencies.get((int) (writeLatencies.size() * 0.90));
-    double p99 = writeLatencies.get((int) (writeLatencies.size() * 0.99));
-    double throughputMb = (totalBytesTransferred.get() / 1024.0 / 1024.0) / totalSec;
-
-    log(String.format("Workload 5 (Write 200MB) Results: Total=%d ops in %.2f s | P50=%.2f ms | P90=%.2f ms | P99=%.2f ms | %.2f MB/s",
-        totalOperations.get(), totalSec, p50, p90, p99, throughputMb));
-
-    recordedMetrics.add(new BenchmarkMetric(
-        getTransportPrefix() + "WL5 Write 200MB",
-        (int) (200L * 1024 * 1024),
-        concurrency,
-        totalOperations.get(),
-        p50, p90, p99, throughputMb,
-        0.0, 0.0, 0.0, 0.0,
-        getUsedHeapMb()
-    ));
-    Instant wlEnd = Instant.now();
-    recordTimeline("WL6_Write200Mb_Workers48", wlStart, wlEnd);
-  }
-
-  private void runW1R3Workload(String label, int objectSizeBytes, int iterations, int concurrency) throws Exception {
-    banner(String.format("W1R3 WORKLOAD: %s (%d bytes, %d iterations, %d threads)",
-        label, objectSizeBytes, iterations, concurrency));
-
-    ExecutorService executor = Executors.newFixedThreadPool(concurrency);
-    List<Double> writeLatencies = new ArrayList<>();
-    List<Double> readLatencies = new ArrayList<>();
-
-    long totalWriteBytes = 0;
-    long totalReadBytes = 0;
-    long workloadStartNs = System.nanoTime();
-
-    List<Future<W1R3Result>> futures = new ArrayList<>();
-    for (int i = 0; i < iterations; i++) {
-      final int taskIndex = i;
-      futures.add(executor.submit(() -> {
-        String objectName = String.format("w1r3-%s-%d-%d.bin", label.replace(" ", ""), taskIndex, System.nanoTime());
-        BlobInfo blobInfo = BlobInfo.newBuilder(TEST_BUCKET, objectName).build();
-
-        // 1. Prepare data
-        byte[] payload = new byte[objectSizeBytes];
-        java.util.Arrays.fill(payload, (byte) (taskIndex & 0xFF));
-
-        // 2. WRITE 1
-        long writeStart = System.nanoTime();
-        Blob created = storage.create(blobInfo, payload);
-        long writeElapsedNs = System.nanoTime() - writeStart;
-        double writeMs = writeElapsedNs / 1_000_000.0;
-
-        // 3. READ 3
-        List<Double> taskReadMs = new ArrayList<>();
-        for (int r = 0; r < 3; r++) {
-          long readStart = System.nanoTime();
-          byte[] readBack = storage.readAllBytes(created.getBlobId());
-          long readElapsedNs = System.nanoTime() - readStart;
-          taskReadMs.add(readElapsedNs / 1_000_000.0);
-          Assert.assertTrue("Downloaded payload size must be > 0", readBack.length > 0);
-        }
-
-        // 4. CLEANUP
-        storage.delete(created.getBlobId());
-
-        return new W1R3Result(writeMs, taskReadMs, objectSizeBytes);
-      }));
+    log("Deleting " + count + " temporary benchmark objects outside timed window...");
+    int workers = Math.min(16, Math.max(1, count));
+    List<Future<?>> delFutures = new ArrayList<Future<?>>(workers);
+    for (int i = 0; i < workers; i++) {
+      final int idx = i;
+      delFutures.add(
+          executor.submit(
+              new Callable<Void>() {
+                @Override
+                public Void call() {
+                  Storage client = pickClient(idx);
+                  BlobId id;
+                  while ((id = cleanupQueue.poll()) != null) {
+                    try {
+                      client.delete(BlobId.of(id.getBucket(), id.getName()));
+                    } catch (Throwable ignored) {
+                    }
+                  }
+                  return null;
+                }
+              }));
     }
-
-    for (Future<W1R3Result> f : futures) {
-      W1R3Result res = f.get();
-      writeLatencies.add(res.writeDurationMs);
-      readLatencies.addAll(res.readDurationsMs);
-      totalWriteBytes += res.bytesTransferred;
-      totalReadBytes += (long) res.bytesTransferred * 3;
+    for (Future<?> f : delFutures) {
+      f.get(120, TimeUnit.SECONDS);
     }
-    executor.shutdown();
-    executor.awaitTermination(60, TimeUnit.SECONDS);
-
-    long workloadTotalElapsedNs = System.nanoTime() - workloadStartNs;
-    double totalDurationSec = workloadTotalElapsedNs / 1_000_000_000.0;
-
-    Collections.sort(writeLatencies);
-    Collections.sort(readLatencies);
-
-    double writeP50 = writeLatencies.get((int) (writeLatencies.size() * 0.50));
-    double writeP90 = writeLatencies.get((int) (writeLatencies.size() * 0.90));
-    double writeP99 = writeLatencies.get((int) (writeLatencies.size() * 0.99));
-    double writeThroughput = (totalWriteBytes / 1024.0 / 1024.0) / totalDurationSec;
-
-    double readP50 = readLatencies.get((int) (readLatencies.size() * 0.50));
-    double readP90 = readLatencies.get((int) (readLatencies.size() * 0.90));
-    double readP99 = readLatencies.get((int) (readLatencies.size() * 0.99));
-    double readThroughput = (totalReadBytes / 1024.0 / 1024.0) / totalDurationSec;
-
-    double heapMb = getUsedHeapMb();
-
-    log(String.format("W1R3 Results for %s:", label));
-    log(String.format("  Total Time:       %.2f sec", totalDurationSec));
-    log(String.format("  Write P50 / P90 / P99: %.2f / %.2f / %.2f ms", writeP50, writeP90, writeP99));
-    log(String.format("  Write Throughput: %.2f MB/s", writeThroughput));
-    log(String.format("  Read P50 / P90 / P99:  %.2f / %.2f / %.2f ms", readP50, readP90, readP99));
-    log(String.format("  Read Throughput:  %.2f MB/s", readThroughput));
-    log(String.format("  JVM Heap Used:    %.1f MB", heapMb));
-
-    BenchmarkMetric metric = new BenchmarkMetric(
-        getTransportPrefix() + label,
-        objectSizeBytes,
-        concurrency,
-        iterations,
-        writeP50, writeP90, writeP99, writeThroughput,
-        readP50, readP90, readP99, readThroughput,
-        heapMb
-    );
-    recordedMetrics.add(metric);
   }
 
   private static double getUsedHeapMb() {
     Runtime rt = Runtime.getRuntime();
-    return (rt.totalMemory() - rt.freeMemory()) / (1024.0 * 1024.0);
+    return (rt.totalMemory() - rt.freeMemory()) / 1_048_576.0;
   }
 
   private static void printSummaryReport() {
-    System.out.println("\n" + repeat("#", 105));
-    System.out.printf("                   GCS SDK CONSOLIDATION: JAVA %s BENCHMARK REPORT\n", DRIVER.toUpperCase());
-    System.out.printf("                       Driver: %s | Live: %b | Target Bucket: %s\n", DRIVER, IS_LIVE, TEST_BUCKET);
-    if ("uds".equalsIgnoreCase(DRIVER)) {
-      System.out.println("                       Sidecar: gcs-core-server (PR #7350 / gcscore.v1)");
-    }
-    System.out.println(repeat("#", 105));
-    System.out.printf("| %-24s | %-7s | %-16s | %-12s | %-16s | %-12s | %-9s |\n",
-        "Benchmark / Payload", "Workers", "Write Lat (P50/99)", "Write MB/s", "Read Lat (P50/99)", "Read MB/s", "Heap (MB)");
-    System.out.println("|" + repeat("-", 26) + "|" + repeat("-", 9) + "|" + repeat("-", 18) + "|" + repeat("-", 14)
-        + "|" + repeat("-", 18) + "|" + repeat("-", 14) + "|" + repeat("-", 11) + "|");
+    boolean isInproc = "uds-inproc".equalsIgnoreCase(DRIVER);
+    System.out.println("\n" + repeat("#", 132));
+    System.out.printf(
+        "  GCS SDK CONSOLIDATION: JAVA %s BENCHMARK REPORT (Transport=%s, Live=%b, Bucket=%s)\n",
+        DRIVER.toUpperCase(), activeTransport.toUpperCase(), IS_LIVE, TEST_BUCKET);
+    System.out.println(repeat("#", 132));
+    System.out.printf(
+        "| %-32s | %-5s | %-15s | %-21s | %-15s | %-21s | %-10s |\n",
+        "Workload",
+        "Thrds",
+        "Write P50/P99",
+        "Write MB/s (MiB/s)",
+        "Read P50/P99",
+        "Read MB/s (MiB/s)",
+        "CPU (s)");
+    System.out.println(repeat("-", 132));
 
     for (BenchmarkMetric m : recordedMetrics) {
-      if (m.payloadLabel.startsWith("Ping")) {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12s | %-16s | %-12.2f | %-9.1f |\n",
-            m.payloadLabel, m.workers, "N/A", "N/A",
-            String.format("%.3f/%.3f ms", m.readP50, m.readP99), m.readThroughputMbSec, m.heapUsedMb);
-      } else if (m.payloadLabel.contains("ListObjects") || m.payloadLabel.contains("ListBucket")) {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12s | %-16s | %-12.1f | %-9.1f |\n",
-            m.payloadLabel, m.workers, "N/A", "N/A",
-            String.format("%.1f/%.1f ms", m.readP50, m.readP99), m.readThroughputMbSec, m.heapUsedMb);
-      } else if (m.payloadLabel.contains("Open")) {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12s | %-16s | %-12.1f | %-9.1f |\n",
-            m.payloadLabel, m.workers, "N/A", "N/A",
-            String.format("%.1f/%.1f ms", m.readP50, m.readP99), m.readThroughputMbSec, m.heapUsedMb);
-      } else if (m.payloadLabel.contains("Read50x2x4")) {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12s | %-16s | %-12.2f | %-9.1f |\n",
-            m.payloadLabel, m.workers, "N/A", "N/A",
-            String.format("%.1f/%.1f ms", m.readP50, m.readP99), m.readThroughputMbSec, m.heapUsedMb);
-      } else if (m.payloadLabel.contains("Random8K")) {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12s | %-16s | %-12.1f | %-9.1f |\n",
-            m.payloadLabel, m.workers, "N/A", "N/A",
-            String.format("%.2f/%.2f ms", m.readP50, m.readP99), m.readThroughputMbSec, m.heapUsedMb);
-      } else if (m.payloadLabel.startsWith("WL4")) {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12s | %-16s | %-12.2f | %-9.1f |\n",
-            m.payloadLabel, m.workers, "N/A", "N/A",
-            String.format("%.1f/%.1f ms", m.readP50, m.readP99), m.readThroughputMbSec, m.heapUsedMb);
-      } else if (m.payloadLabel.startsWith("WL5")) {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12.2f | %-16s | %-12s | %-9.1f |\n",
-            m.payloadLabel, m.workers,
-            String.format("%.1f/%.1f ms", m.writeP50, m.writeP99), m.writeThroughputMbSec,
-            "N/A", "N/A", m.heapUsedMb);
-      } else {
-        System.out.printf("| %-24s | %-7d | %-16s | %-12.2f | %-16s | %-12.2f | %-9.1f |\n",
-            m.payloadLabel,
-            m.workers,
-            String.format("%.1f/%.1f ms", m.writeP50, m.writeP99),
-            m.writeThroughputMbSec,
-            String.format("%.1f/%.1f ms", m.readP50, m.readP99),
-            m.readThroughputMbSec,
-            m.heapUsedMb);
-      }
+      boolean isOpsMetric =
+          m.payloadLabel.contains("Open")
+              || m.payloadLabel.contains("Random8K")
+              || m.payloadLabel.contains("ListObjects")
+              || m.payloadLabel.contains("ListBuckets");
+      String wLat =
+          m.writeP99 > 0 ? String.format("%.1f/%.1f ms", m.writeP50, m.writeP99) : "N/A";
+      String wBw =
+          m.writeMbSec > 0
+              ? String.format("%.1f (%.1f)", m.writeMbSec, m.writeMibSec)
+              : "N/A";
+      String rLat =
+          m.readP99 > 0 ? String.format("%.2f/%.2f ms", m.readP50, m.readP99) : "N/A";
+      String rBw =
+          m.readMbSec > 0
+              ? (isOpsMetric
+                  ? String.format("%.1f ops/s", m.readMbSec)
+                  : String.format("%.1f (%.1f)", m.readMbSec, m.readMibSec))
+              : "N/A";
+      double totalProcCpu =
+          isInproc
+              ? Math.max(m.telemetry.jvmCpuSec, m.telemetry.rustCpuSec)
+              : (m.telemetry.jvmCpuSec + m.telemetry.rustCpuSec);
+
+      System.out.printf(
+          "| %-32s | %-5d | %-15s | %-21s | %-15s | %-21s | %-10.2f |\n",
+          m.payloadLabel, m.workers, wLat, wBw, rLat, rBw, totalProcCpu);
     }
-    System.out.println(repeat("#", 105));
+    System.out.println(repeat("#", 132));
 
     if (finalStats != null) {
-      System.out.println("\n" + repeat("-", 60));
-      System.out.println("  SIDECAR PROCESS TELEMETRY (Stats RPC)");
-      System.out.println(repeat("-", 60));
-      System.out.printf("  Sidecar Process PID       : %d\n", finalStats.getPid());
-      System.out.printf("  Worker Thread Count       : %d\n", finalStats.getThreads());
+      System.out.println("\n" + repeat("-", 72));
+      if (isInproc) {
+        System.out.println(
+            "  UNIFIED PROCESS TELEMETRY (JVM + In-Process Rust Core — Same OS PID)");
+      } else {
+        System.out.println("  OUT-OF-PROCESS RUST SIDECAR TELEMETRY (Stats RPC)");
+      }
+      System.out.println(repeat("-", 72));
+      System.out.printf("  Process PID               : %d\n", finalStats.getPid());
+      System.out.printf("  OS Thread Count           : %d\n", finalStats.getThreads());
       System.out.printf("  CPU User Time             : %.3f sec\n", finalStats.getCpuUserSecs());
       System.out.printf("  CPU System Time           : %.3f sec\n", finalStats.getCpuSysSecs());
-      System.out.printf("  Current RSS Memory        : %,d KiB (%.1f MiB)\n",
-          finalStats.getRssBytes() / 1024, finalStats.getRssBytes() / 1024.0 / 1024.0);
-      System.out.printf("  Peak Resident Memory (HWM): %,d KiB (%.1f MiB)\n",
-          finalStats.getPeakRssBytes() / 1024, finalStats.getPeakRssBytes() / 1024.0 / 1024.0);
-      System.out.printf("  Total RPCs Served         : %,d\n", finalStats.getRpcsServed());
+      System.out.printf(
+          "  Current RSS Memory        : %,d KiB (%.1f MiB)\n",
+          finalStats.getRssBytes() / 1024, finalStats.getRssBytes() / 1_048_576.0);
+      System.out.printf(
+          "  Peak Resident Memory (HWM): %,d KiB (%.1f MiB)\n",
+          finalStats.getPeakRssBytes() / 1024, finalStats.getPeakRssBytes() / 1_048_576.0);
+      System.out.printf("  Total UDS RPCs Served     : %,d\n", finalStats.getRpcsServed());
       System.out.printf("  Uptime                    : %,d ms\n", finalStats.getUptimeMs());
-      System.out.println(repeat("-", 60) + "\n");
+      System.out.println(repeat("-", 72) + "\n");
     }
   }
 
-  // --- Helper Structs ---
-
-  private static class W1R3Result {
-    final double writeDurationMs;
-    final List<Double> readDurationsMs;
-    final int bytesTransferred;
-
-    W1R3Result(double writeDurationMs, List<Double> readDurationsMs, int bytesTransferred) {
-      this.writeDurationMs = writeDurationMs;
-      this.readDurationsMs = readDurationsMs;
-      this.bytesTransferred = bytesTransferred;
-    }
-  }
-
-  public static class BenchmarkMetric {
+  public static final class BenchmarkMetric {
     public final String payloadLabel;
     public final int objectSizeBytes;
     public final int workers;
@@ -1525,17 +1876,33 @@ public class ITUdsVeneerBenchmark {
     public final double writeP50;
     public final double writeP90;
     public final double writeP99;
-    public final double writeThroughputMbSec;
+    public final double writeMbSec;
+    public final double writeMibSec;
     public final double readP50;
     public final double readP90;
     public final double readP99;
-    public final double readThroughputMbSec;
+    public final double readMbSec;
+    public final double readMibSec;
     public final double heapUsedMb;
+    final WorkloadTelemetryDelta telemetry;
 
-    public BenchmarkMetric(String payloadLabel, int objectSizeBytes, int workers, int iterations,
-        double writeP50, double writeP90, double writeP99, double writeThroughputMbSec,
-        double readP50, double readP90, double readP99, double readThroughputMbSec,
-        double heapUsedMb) {
+    BenchmarkMetric(
+        String payloadLabel,
+        int objectSizeBytes,
+        int workers,
+        int iterations,
+        double writeP50,
+        double writeP90,
+        double writeP99,
+        double writeMbSec,
+        double writeMibSec,
+        double readP50,
+        double readP90,
+        double readP99,
+        double readMbSec,
+        double readMibSec,
+        double heapUsedMb,
+        WorkloadTelemetryDelta telemetry) {
       this.payloadLabel = payloadLabel;
       this.objectSizeBytes = objectSizeBytes;
       this.workers = workers;
@@ -1543,34 +1910,15 @@ public class ITUdsVeneerBenchmark {
       this.writeP50 = writeP50;
       this.writeP90 = writeP90;
       this.writeP99 = writeP99;
-      this.writeThroughputMbSec = writeThroughputMbSec;
+      this.writeMbSec = writeMbSec;
+      this.writeMibSec = writeMibSec;
       this.readP50 = readP50;
       this.readP90 = readP90;
       this.readP99 = readP99;
-      this.readThroughputMbSec = readThroughputMbSec;
+      this.readMbSec = readMbSec;
+      this.readMibSec = readMibSec;
       this.heapUsedMb = heapUsedMb;
+      this.telemetry = telemetry;
     }
-  }
-
-  public static void main(String[] args) throws Exception {
-    setUp();
-    try {
-      ITUdsVeneerBenchmark benchmark = new ITUdsVeneerBenchmark();
-      benchmark.test00_PingLatencyMicrobenchmark();
-      benchmark.test01_VeneerCreateAndReadBytes();
-      benchmark.test02_VeneerReadAndWriteChannels();
-      benchmark.test03_VeneerCreateFromAndDownloadToPath();
-      benchmark.test04_VeneerListAndGetOperations();
-      benchmark.test05_W1R3Benchmark_1KiB();
-      benchmark.test06_W1R3Benchmark_100KiB();
-      benchmark.test07_W1R3Benchmark_16MiB();
-      benchmark.test08_W1R3Benchmark_200MiB();
-      benchmark.test09_List100ItemsBenchmark();
-      benchmark.test10_CloudpathWorkload4_Read16MbChunkOf200Mb();
-      benchmark.test11_CloudpathWorkload5_Write200Mb();
-    } finally {
-      tearDown();
-    }
-    System.exit(0);
   }
 }
