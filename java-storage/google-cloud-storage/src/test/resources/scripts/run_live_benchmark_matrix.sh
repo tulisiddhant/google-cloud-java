@@ -153,25 +153,31 @@ BUCKET_COUNT="$(gcloud storage buckets list --project="${PROJECT_ID}" --format='
 echo "[Gate 2] Project ${PROJECT_ID} currently has ${BUCKET_COUNT} buckets." | tee "${OUT_DIR}/project_bucket_count.txt"
 
 cd "${MODULE_DIR}"
-echo "[Gate 2] Compiling test sources & running ITUdsVeneerComplianceTest..."
+echo "[Gate 2] Compiling test sources..."
 mvn test-compile -Dcheckstyle.skip -Dfmt.skip=true
-mvn test -Dtest=ITUdsVeneerComplianceTest \
-  -Dgcs.benchmark.driver=uds \
-  -Dgcs.sidecar.binary.path="${SIDECAR_BIN}" \
-  -Dcheckstyle.skip -Dfmt.skip=true \
-  | tee "${OUT_DIR}/gate2_compliance_sidecar.log"
 
 HAS_INPROC="false"
 if [[ -f "${MODULE_DIR}/src/test/java/com/google/cloud/storage/sidecar/RustInprocSidecarManager.java" && -f "${INPROC_LIB}" ]]; then
   HAS_INPROC="true"
-  mvn test -Dtest=ITUdsVeneerComplianceTest \
-    -Dgcs.benchmark.driver=uds-inproc \
-    -Dgcs.inproc.library.path="${INPROC_LIB}" \
-    -Dcheckstyle.skip -Dfmt.skip=true \
-    | tee "${OUT_DIR}/gate2_compliance_inproc.log"
+fi
+
+if [[ "${SKIP_GATE2:-false}" != "true" ]]; then
+  echo "[Gate 2] Running ITUdsVeneerComplianceTest..."
+  mvn surefire:test -Dtest=ITUdsVeneerComplianceTest \
+    -Dgcs.benchmark.driver=uds \
+    -Dgcs.sidecar.binary.path="${SIDECAR_BIN}" \
+    | tee "${OUT_DIR}/gate2_compliance_sidecar.log"
+
+  if [[ "${HAS_INPROC}" == "true" ]]; then
+    mvn surefire:test -Dtest=ITUdsVeneerComplianceTest \
+      -Dgcs.benchmark.driver=uds-inproc \
+      -Dgcs.inproc.library.path="${INPROC_LIB}" \
+      | tee "${OUT_DIR}/gate2_compliance_inproc.log"
+  fi
 fi
 
 BENCH_TEST_SPEC="ITUdsVeneerBenchmark#test00b_Open_200MB+test00c_Read50x2x4_Serial+test00d_Read50x2x4_Concurrent+test00e_Random8K+test09a_ListObjects100Benchmark+test09b_ListBucketsBenchmark+test10_CloudpathWorkload4_Read16MbChunkOf200Mb+test11_CloudpathWorkload5_Write200Mb"
+REGIONAL_GRPC_TEST_SPEC="ITUdsVeneerBenchmark#test00b_Open_200MB+test00c_Read50x2x4_Serial+test00d_Read50x2x4_Concurrent+test00e_Random8K+test09a_ListObjects100Benchmark+test09b_ListBucketsBenchmark+test10_CloudpathWorkload4_Read16MbChunkOf200Mb"
 
 run_suite() {
   local suite_label="$1"
@@ -191,7 +197,7 @@ run_suite() {
   echo "--------------------------------------------------------------------------------"
 
   # shellcheck disable=SC2086
-  mvn test -Dtest="${test_spec}" \
+  mvn surefire:test -Dtest="${test_spec}" \
     -Dgcs.live.benchmark=true \
     -Dgcs.project.id="${PROJECT_ID}" \
     -Dgcs.test.bucket="${bucket}" \
@@ -209,7 +215,6 @@ run_suite() {
     -Dgcs.bench.post.wait.sec="${POST_WAIT_SEC}" \
     -Dgcs.bench.timeline.file="${timeline_file}" \
     ${extra_flags} \
-    -Dcheckstyle.skip -Dfmt.skip=true \
     | tee "${log_file}"
 
   python3 "${SCRIPT_DIR}/fetch_gcp_metrics.py" \
@@ -220,34 +225,49 @@ run_suite() {
     | tee "${gcm_txt}"
 }
 
-DRIVERS=("native" "uds")
-if [[ "${HAS_INPROC}" == "true" ]]; then
+read -r -a DRIVERS <<< "${DRIVERS_OVERRIDE:-native uds}"
+if [[ -z "${DRIVERS_OVERRIDE:-}" && "${HAS_INPROC}" == "true" ]]; then
   DRIVERS+=("uds-inproc")
 fi
 
-SUITES="${SUITES:-regional_grpc regional_json zonal_grpc}"
+SUITES="${SUITES:-zonal_grpc regional_grpc regional_json}"
+
+if [[ " ${SUITES} " == *" zonal_grpc "* ]]; then
+  # 1. Zonal Rapid [gRPC] Suite (includes 5-minute BidiWriteObject blobAppendableUpload WL6)
+  for drv in "${DRIVERS[@]}"; do
+    run_suite "zonal_grpc_${drv}" "${ZONAL_BUCKET}" "${drv}" "grpc" "${BENCH_TEST_SPEC}" "-Dgcs.bench.strict.list100=true"
+  done
+fi
 
 if [[ " ${SUITES} " == *" regional_grpc "* ]]; then
-  # 1. Standard Regional [gRPC] Suite
+  # 2. Standard Regional [gRPC] Suite (BidiWriteObject is Zonal-only; Regional WriteObject runs in regional_json)
   for drv in "${DRIVERS[@]}"; do
-    run_suite "regional_grpc_${drv}" "${REGIONAL_BUCKET}" "${drv}" "grpc" "${BENCH_TEST_SPEC}" "-Dgcs.bench.strict.list100=true"
+    run_suite "regional_grpc_${drv}" "${REGIONAL_BUCKET}" "${drv}" "grpc" "${REGIONAL_GRPC_TEST_SPEC}" "-Dgcs.bench.strict.list100=true"
   done
 fi
 
 if [[ " ${SUITES} " == *" regional_json "* ]]; then
-  # 2. Standard Regional [JSON] Suite (ReadObject & WriteObject in JSON)
+  # 3. Standard Regional [JSON] Suite (ReadObject & WriteObject in JSON)
   JSON_TEST_SPEC="ITUdsVeneerBenchmark#test00c_Read50x2x4_Serial+test00d_Read50x2x4_Concurrent+test10_CloudpathWorkload4_Read16MbChunkOf200Mb+test11_CloudpathWorkload5_Write200Mb"
   for drv in "${DRIVERS[@]}"; do
     run_suite "regional_json_${drv}" "${REGIONAL_BUCKET}" "${drv}" "json" "${JSON_TEST_SPEC}" "-Dgcs.bench.wl5.api=reader"
   done
 fi
 
-if [[ " ${SUITES} " == *" zonal_grpc "* ]]; then
-  # 3. Zonal Rapid [gRPC] Suite (includes 5-minute BidiWriteObject blobAppendableUpload WL6)
-  for drv in "${DRIVERS[@]}"; do
-    run_suite "zonal_grpc_${drv}" "${ZONAL_BUCKET}" "${drv}" "grpc" "${BENCH_TEST_SPEC}" "-Dgcs.bench.strict.list100=true"
-  done
-fi
+echo "[Gate 3] Waiting 90s before final Cloud Monitoring refresh pass..."
+sleep 90
+for tl in "${OUT_DIR}"/timeline_*.json; do
+  [[ -f "${tl}" ]] || continue
+  base="$(basename "${tl}" .json)"
+  label="${base#timeline_}"
+  echo "[Gate 3] Final GCM telemetry refresh for ${label}:"
+  python3 "${SCRIPT_DIR}/fetch_gcp_metrics.py" \
+    --project "${PROJECT_ID}" \
+    --instance-id "${INSTANCE_ID}" \
+    --timeline "${tl}" \
+    --output "${OUT_DIR}/gcm_final_${label}.json" \
+    | tee "${OUT_DIR}/gcm_final_${label}.txt"
+done
 
 echo "================================================================================"
 echo "  ALL GATE 2 & GATE 3 SUITES COMPLETED: ${OUT_DIR}"
