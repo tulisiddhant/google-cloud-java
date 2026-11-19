@@ -200,9 +200,10 @@ public final class UdsStorage implements InvocationHandler, AutoCloseable {
           String resolvedSock = this.socketPath;
           if (resolvedSock == null || resolvedSock.isEmpty()) {
             if (driverMode == DriverMode.INPROC) {
-              ownedServer = startInprocReflectively();
-              Method getSock = ownedServer.getClass().getMethod("getSocketPath");
-              resolvedSock = ((Path) getSock.invoke(ownedServer)).toAbsolutePath().toString();
+              RustInprocSidecarManager mgr = RustInprocSidecarManager.createDefault();
+              mgr.start(Duration.ofSeconds(15));
+              ownedServer = mgr;
+              resolvedSock = mgr.getSocketSpec();
             } else {
               RustSidecarProcessManager mgr = RustSidecarProcessManager.createDefault();
               mgr.start(Duration.ofSeconds(15));
@@ -252,14 +253,6 @@ public final class UdsStorage implements InvocationHandler, AutoCloseable {
         }
         throw new IllegalStateException("Failed to initialize UdsStorage client", e);
       }
-    }
-
-    private static AutoCloseable startInprocReflectively() throws Exception {
-      Class<?> cls =
-          Class.forName("com.google.cloud.storage.sidecar.RustInprocSidecarManager");
-      AutoCloseable mgr = (AutoCloseable) cls.getMethod("createDefault").invoke(null);
-      cls.getMethod("start", Duration.class).invoke(mgr, Duration.ofSeconds(15));
-      return mgr;
     }
   }
 
