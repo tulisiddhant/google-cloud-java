@@ -56,7 +56,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Queue;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -1611,26 +1613,31 @@ public class ITUdsVeneerBenchmark {
       AtomicInteger totalOps = new AtomicInteger(0);
 
       long startNs = System.nanoTime();
-      executeWriteWorkers(
-          executor,
-          concurrency,
-          durationSec,
-          iterations,
-          targetSize,
-          writeApi,
-          reusableChunk,
-          objectsToCleanup,
-          writeLatencies,
-          totalBytes,
-          totalOps);
-      double totalSec = (System.nanoTime() - startNs) / 1_000_000_000.0;
-
-      Instant wlEnd = Instant.now();
-      WorkloadTelemetryDelta delta = endWorkloadTelemetry(snap);
+      double totalSec;
+      Instant wlEnd;
+      WorkloadTelemetryDelta delta;
+      try {
+        executeWriteWorkers(
+            executor,
+            concurrency,
+            durationSec,
+            iterations,
+            targetSize,
+            writeApi,
+            reusableChunk,
+            objectsToCleanup,
+            writeLatencies,
+            totalBytes,
+            totalOps);
+      } finally {
+        totalSec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+        wlEnd = Instant.now();
+        delta = endWorkloadTelemetry(snap);
+        // Post-workload cleanup strictly OUTSIDE [wlStart, wlEnd] and [startNs, totalSec],
+        // and guaranteed to run even if an exception occurs mid-stream!
+        cleanupCreatedObjects(executor, objectsToCleanup);
+      }
       recordTimeline("WL6_Write200Mb_Workers48_" + writeApi, wlStart, wlEnd);
-
-      // Post-workload cleanup strictly OUTSIDE [wlStart, wlEnd] and [startNs, totalSec]!
-      cleanupCreatedObjects(executor, objectsToCleanup);
 
       Assert.assertFalse("Expected completed writes in WL6", writeLatencies.isEmpty());
       Collections.sort(writeLatencies);
@@ -1684,6 +1691,8 @@ public class ITUdsVeneerBenchmark {
       throws Exception {
     final long deadlineMs =
         durationSec > 0 ? (System.currentTimeMillis() + durationSec * 1000L) : Long.MAX_VALUE;
+    final int slotCount = Math.max(1, Integer.getInteger("gcs.bench.wl6.slots", 2));
+    final Set<BlobId> queuedSet = ConcurrentHashMap.newKeySet();
     final BlobAppendableUploadConfig appendConfig =
         BlobAppendableUploadConfig.of().withCloseAction(CloseAction.FINALIZE_WHEN_CLOSING);
 
@@ -1699,11 +1708,15 @@ public class ITUdsVeneerBenchmark {
                   int count = 0;
                   while ((durationSec > 0 && System.currentTimeMillis() < deadlineMs)
                       || (durationSec == 0 && count < iterations)) {
-                    count++;
                     String objName =
                         String.format(
-                            "bench-write-w%d-%d-%d.bin", workerId, count, System.nanoTime());
-                    BlobInfo info = BlobInfo.newBuilder(TEST_BUCKET, objName).build();
+                            "bench-write-w%d-slot%d.bin", workerId, count % slotCount);
+                    count++;
+                    BlobId slotKey = BlobId.of(TEST_BUCKET, objName);
+                    if (queuedSet.add(slotKey)) {
+                      cleanupQueue.offer(slotKey);
+                    }
+                    BlobInfo info = BlobInfo.newBuilder(slotKey).build();
 
                     long opStart = System.nanoTime();
                     if ("appendable".equals(writeApi)) {
@@ -1724,8 +1737,7 @@ public class ITUdsVeneerBenchmark {
                         }
                         ch.finalizeAndClose();
                       }
-                      BlobInfo created = upload.getResult().get(300, TimeUnit.SECONDS);
-                      cleanupQueue.offer(created.getBlobId());
+                      upload.getResult().get(300, TimeUnit.SECONDS);
                     } else {
                       try (WriteChannel writer = client.writer(info)) {
                         long remaining = targetSize;
@@ -1738,7 +1750,6 @@ public class ITUdsVeneerBenchmark {
                           remaining -= toWrite;
                         }
                       }
-                      cleanupQueue.offer(info.getBlobId());
                     }
                     long opNs = System.nanoTime() - opStart;
                     if (latenciesOut != null) {
