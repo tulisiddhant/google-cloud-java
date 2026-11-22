@@ -1,0 +1,720 @@
+/*
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.cloud.storage.sidecar;
+
+import static java.util.Objects.requireNonNull;
+
+import com.google.api.core.ApiFuture;
+import com.google.api.gax.paging.Page;
+import com.google.cloud.Policy;
+import com.google.cloud.ReadChannel;
+import com.google.cloud.WriteChannel;
+import com.google.cloud.storage.Acl;
+import com.google.cloud.storage.Acl.Entity;
+import com.google.cloud.storage.Blob;
+import com.google.cloud.storage.BlobAppendableUpload;
+import com.google.cloud.storage.BlobAppendableUploadConfig;
+import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.BlobInfo;
+import com.google.cloud.storage.BlobReadSession;
+import com.google.cloud.storage.BlobWriteSession;
+import com.google.cloud.storage.Bucket;
+import com.google.cloud.storage.BucketInfo;
+import com.google.cloud.storage.CopyWriter;
+import com.google.cloud.storage.HmacKey;
+import com.google.cloud.storage.HmacKey.HmacKeyMetadata;
+import com.google.cloud.storage.Notification;
+import com.google.cloud.storage.NotificationInfo;
+import com.google.cloud.storage.PostPolicyV4;
+import com.google.cloud.storage.PostPolicyV4.PostConditionsV4;
+import com.google.cloud.storage.PostPolicyV4.PostFieldsV4;
+import com.google.cloud.storage.ServiceAccount;
+import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.StorageBatch;
+import com.google.cloud.storage.StorageOptions;
+import com.google.cloud.storage.sidecar.proto.Empty;
+import com.google.cloud.storage.sidecar.proto.GcsCoreGrpc;
+import com.google.cloud.storage.sidecar.proto.StatsRequest;
+import com.google.cloud.storage.sidecar.proto.StatsResponse;
+import io.grpc.Channel;
+import io.grpc.ClientInterceptors;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URL;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.OptionalLong;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * {@link Storage} veneer implementation backed by the shared Rust {@code gcscore.v1.GcsCore}
+ * service over a local Unix Domain Socket ({@code AF_UNIX}).
+ *
+ * <p>Step 0 provides server lifecycle management, Netty UDS channel setup, OAuth2 credential
+ * lending, and {@code GcsCore.Stats} telemetry. Data-plane and control-plane veneer methods are
+ * added incrementally per workload in Steps 1–7.
+ */
+public final class UdsStorage implements Storage {
+
+  private static final long DEFAULT_STARTUP_TIMEOUT_MS = 15_000L;
+
+  private final StorageOptions options;
+  private final DriverMode driverMode;
+  private final UdsTransport transport;
+  private final UdsServerRuntime serverRuntime;
+  private final UdsChannelFactory.ChannelHandle channelHandle;
+  private final GcsSessionManager sessionManager;
+  private final GcsCoreGrpc.GcsCoreBlockingStub blockingStub;
+  private final GcsCoreGrpc.GcsCoreStub asyncStub;
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+
+  private UdsStorage(
+      StorageOptions options,
+      DriverMode driverMode,
+      UdsTransport transport,
+      UdsServerRuntime serverRuntime,
+      UdsChannelFactory.ChannelHandle channelHandle,
+      GcsSessionManager sessionManager) {
+    this.options = options;
+    this.driverMode = driverMode;
+    this.transport = transport;
+    this.serverRuntime = serverRuntime;
+    this.channelHandle = channelHandle;
+    this.sessionManager = sessionManager;
+
+    Channel intercepted = ClientInterceptors.intercept(channelHandle.channel(), sessionManager);
+    this.blockingStub = GcsCoreGrpc.newBlockingStub(intercepted);
+    this.asyncStub = GcsCoreGrpc.newStub(intercepted);
+  }
+
+  public static Builder newBuilder(StorageOptions baseOptions) {
+    return new Builder(baseOptions);
+  }
+
+  /** Builder for {@link UdsStorage}. */
+  public static final class Builder {
+    private final StorageOptions baseOptions;
+    private DriverMode driverMode = DriverMode.SIDECAR;
+    private UdsTransport transport = UdsTransport.GRPC;
+    private String socketPath;
+    private String sidecarBinaryPath;
+    private long startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS;
+
+    private Builder(StorageOptions baseOptions) {
+      this.baseOptions = requireNonNull(baseOptions, "baseOptions");
+    }
+
+    public Builder setDriverMode(DriverMode driverMode) {
+      this.driverMode = requireNonNull(driverMode, "driverMode");
+      return this;
+    }
+
+    public Builder setTransport(UdsTransport transport) {
+      this.transport = requireNonNull(transport, "transport");
+      return this;
+    }
+
+    public Builder setSocketPath(String socketPath) {
+      this.socketPath = socketPath;
+      return this;
+    }
+
+    public Builder setSidecarBinaryPath(String sidecarBinaryPath) {
+      this.sidecarBinaryPath = sidecarBinaryPath;
+      return this;
+    }
+
+    public Builder setStartupTimeoutMs(long startupTimeoutMs) {
+      this.startupTimeoutMs = startupTimeoutMs;
+      return this;
+    }
+
+    public UdsStorage build() throws IOException {
+      String resolvedSocket =
+          (socketPath == null || socketPath.isEmpty())
+              ? UdsServerRuntime.newUniqueSocketPath()
+              : socketPath;
+
+      UdsServerRuntime runtime = createRuntime(resolvedSocket);
+      UdsChannelFactory.ChannelHandle chHandle = null;
+      GcsSessionManager sessMgr = null;
+      boolean ok = false;
+      try {
+        runtime.start();
+        chHandle = UdsChannelFactory.open(resolvedSocket);
+        UdsChannelFactory.awaitReady(chHandle.channel(), startupTimeoutMs, runtime);
+        sessMgr = GcsSessionManager.create(chHandle.channel(), baseOptions);
+        if (runtime instanceof SidecarServerRuntime && !runtime.serverPid().isPresent()) {
+          StatsResponse stats =
+              GcsCoreGrpc.newBlockingStub(
+                      ClientInterceptors.intercept(chHandle.channel(), sessMgr))
+                  .withDeadlineAfter(5, TimeUnit.SECONDS)
+                  .stats(StatsRequest.newBuilder().setResetPeakRss(false).build());
+          ((SidecarServerRuntime) runtime).recordServerPid(stats.getPid());
+        }
+        UdsStorage instance =
+            new UdsStorage(baseOptions, driverMode, transport, runtime, chHandle, sessMgr);
+        ok = true;
+        return instance;
+      } finally {
+        if (!ok) {
+          if (sessMgr != null) {
+            sessMgr.close();
+          }
+          if (chHandle != null) {
+            chHandle.close();
+          }
+          runtime.close();
+        }
+      }
+    }
+
+    private UdsServerRuntime createRuntime(String resolvedSocket) {
+      if (driverMode == DriverMode.SIDECAR) {
+        String bin =
+            sidecarBinaryPath != null
+                ? sidecarBinaryPath
+                : System.getProperty("uds.sidecar.bin", "");
+        if (bin.isEmpty()) {
+          throw new IllegalArgumentException(
+              "sidecarBinaryPath must be set via Builder or -Duds.sidecar.bin for SIDECAR mode");
+        }
+        return new SidecarServerRuntime(bin, resolvedSocket);
+      }
+      throw new UnsupportedOperationException("Unsupported DriverMode: " + driverMode);
+    }
+  }
+
+  public DriverMode getDriverMode() {
+    return driverMode;
+  }
+
+  public UdsTransport getTransport() {
+    return transport;
+  }
+
+  public String getSocketPath() {
+    return serverRuntime.socketPath();
+  }
+
+  public OptionalLong getServerPid() {
+    return serverRuntime.serverPid();
+  }
+
+  public GcsSessionManager getSessionManager() {
+    return sessionManager;
+  }
+
+  /** Queries {@code GcsCore.Stats} for supplementary Rust core CPU & VmHWM diagnostics. */
+  public StatsResponse getCoreStats(boolean resetPeakRss) {
+    return blockingStub
+        .withDeadlineAfter(10, TimeUnit.SECONDS)
+        .stats(StatsRequest.newBuilder().setResetPeakRss(resetPeakRss).build());
+  }
+
+  GcsCoreGrpc.GcsCoreBlockingStub blockingStub() {
+    return blockingStub;
+  }
+
+  GcsCoreGrpc.GcsCoreStub asyncStub() {
+    return asyncStub;
+  }
+
+  @Override
+  public StorageOptions getOptions() {
+    return options;
+  }
+
+  @Override
+  public void close() {
+    if (!closed.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      sessionManager.close();
+    } finally {
+      try {
+        GcsCoreGrpc.newBlockingStub(channelHandle.channel())
+            .withDeadlineAfter(2, TimeUnit.SECONDS)
+            .shutdown(Empty.getDefaultInstance());
+      } catch (RuntimeException ignored) {
+        // Server may already be shutting down.
+      } finally {
+        try {
+          channelHandle.close();
+        } finally {
+          serverRuntime.close();
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 6 POC Veneer APIs — implemented step by step in Steps 1–7
+  // ---------------------------------------------------------------------------
+
+  @Override
+  public ApiFuture<BlobReadSession> blobReadSession(BlobId id, BlobSourceOption... options) {
+    return unsupported("blobReadSession (implemented in Step 1 / WL1)");
+  }
+
+  @Override
+  public ReadChannel reader(String bucket, String blob, BlobSourceOption... options) {
+    return reader(BlobId.of(bucket, blob), options);
+  }
+
+  @Override
+  public ReadChannel reader(BlobId blob, BlobSourceOption... options) {
+    return unsupported("reader (implemented in Step 2 / WL2)");
+  }
+
+  @Override
+  public BlobAppendableUpload blobAppendableUpload(
+      BlobInfo blobInfo, BlobAppendableUploadConfig uploadConfig, BlobWriteOption... options) {
+    return unsupported("blobAppendableUpload (implemented in Step 6 / WL6)");
+  }
+
+  @Override
+  public WriteChannel writer(BlobInfo blobInfo, BlobWriteOption... options) {
+    return unsupported("writer (implemented in Step 6 / WL6)");
+  }
+
+  @Override
+  public Page<Blob> list(String bucket, BlobListOption... options) {
+    return unsupported("list(bucket, BlobListOption...) (implemented in Step 7 / WL7a)");
+  }
+
+  @Override
+  public Page<Bucket> list(BucketListOption... options) {
+    return unsupported("list(BucketListOption...) (implemented in Step 7 / WL7b)");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Out-of-scope Storage interface methods
+  // ---------------------------------------------------------------------------
+
+  private static <T> T unsupported(String method) {
+    throw new UnsupportedOperationException("UdsStorage: " + method + " is not supported");
+  }
+
+  @Override
+  public Bucket create(BucketInfo bucketInfo, BucketTargetOption... options) {
+    return unsupported("create(BucketInfo)");
+  }
+
+  @Override
+  public Blob create(BlobInfo blobInfo, BlobTargetOption... options) {
+    return unsupported("create(BlobInfo)");
+  }
+
+  @Override
+  public Blob create(BlobInfo blobInfo, byte[] content, BlobTargetOption... options) {
+    return unsupported("create(BlobInfo, byte[])");
+  }
+
+  @Override
+  public Blob create(
+      BlobInfo blobInfo, byte[] content, int offset, int length, BlobTargetOption... options) {
+    return unsupported("create(BlobInfo, byte[], int, int)");
+  }
+
+  @Override
+  @Deprecated
+  public Blob create(BlobInfo blobInfo, InputStream content, BlobWriteOption... options) {
+    return unsupported("create(BlobInfo, InputStream)");
+  }
+
+  @Override
+  public Blob createFrom(BlobInfo blobInfo, Path path, BlobWriteOption... options) {
+    return unsupported("createFrom(BlobInfo, Path)");
+  }
+
+  @Override
+  public Blob createFrom(
+      BlobInfo blobInfo, Path path, int bufferSize, BlobWriteOption... options) {
+    return unsupported("createFrom(BlobInfo, Path, int)");
+  }
+
+  @Override
+  public Blob createFrom(BlobInfo blobInfo, InputStream content, BlobWriteOption... options) {
+    return unsupported("createFrom(BlobInfo, InputStream)");
+  }
+
+  @Override
+  public Blob createFrom(
+      BlobInfo blobInfo, InputStream content, int bufferSize, BlobWriteOption... options) {
+    return unsupported("createFrom(BlobInfo, InputStream, int)");
+  }
+
+  @Override
+  public Bucket get(String bucket, BucketGetOption... options) {
+    return unsupported("get(String)");
+  }
+
+  @Override
+  public Bucket lockRetentionPolicy(BucketInfo bucket, BucketTargetOption... options) {
+    return unsupported("lockRetentionPolicy");
+  }
+
+  @Override
+  public Blob get(String bucket, String blob, BlobGetOption... options) {
+    return unsupported("get(String, String)");
+  }
+
+  @Override
+  public Blob get(BlobId blob, BlobGetOption... options) {
+    return unsupported("get(BlobId, BlobGetOption...)");
+  }
+
+  @Override
+  public Blob get(BlobId blob) {
+    return unsupported("get(BlobId)");
+  }
+
+  @Override
+  public Blob restore(BlobId blob, BlobRestoreOption... options) {
+    return unsupported("restore");
+  }
+
+  @Override
+  public Bucket update(BucketInfo bucketInfo, BucketTargetOption... options) {
+    return unsupported("update(BucketInfo)");
+  }
+
+  @Override
+  public Blob update(BlobInfo blobInfo, BlobTargetOption... options) {
+    return unsupported("update(BlobInfo, BlobTargetOption...)");
+  }
+
+  @Override
+  public Blob update(BlobInfo blobInfo) {
+    return unsupported("update(BlobInfo)");
+  }
+
+  @Override
+  public boolean delete(String bucket, BucketSourceOption... options) {
+    return unsupported("delete(String)");
+  }
+
+  @Override
+  public boolean delete(String bucket, String blob, BlobSourceOption... options) {
+    return unsupported("delete(String, String)");
+  }
+
+  @Override
+  public boolean delete(BlobId blob, BlobSourceOption... options) {
+    return unsupported("delete(BlobId, BlobSourceOption...)");
+  }
+
+  @Override
+  public boolean delete(BlobId blob) {
+    return unsupported("delete(BlobId)");
+  }
+
+  @Override
+  public Blob compose(ComposeRequest composeRequest) {
+    return unsupported("compose");
+  }
+
+  @Override
+  public CopyWriter copy(CopyRequest copyRequest) {
+    return unsupported("copy");
+  }
+
+  @Override
+  public byte[] readAllBytes(String bucket, String blob, BlobSourceOption... options) {
+    return unsupported("readAllBytes(String, String)");
+  }
+
+  @Override
+  public byte[] readAllBytes(BlobId blob, BlobSourceOption... options) {
+    return unsupported("readAllBytes(BlobId)");
+  }
+
+  @Override
+  public StorageBatch batch() {
+    return unsupported("batch");
+  }
+
+  @Override
+  public void downloadTo(BlobId blob, Path path, BlobSourceOption... options) {
+    unsupported("downloadTo(BlobId, Path)");
+  }
+
+  @Override
+  public void downloadTo(BlobId blob, OutputStream outputStream, BlobSourceOption... options) {
+    unsupported("downloadTo(BlobId, OutputStream)");
+  }
+
+  @Override
+  public WriteChannel writer(URL signedURL) {
+    return unsupported("writer(URL)");
+  }
+
+  @Override
+  public URL signUrl(BlobInfo blobInfo, long duration, TimeUnit unit, SignUrlOption... options) {
+    return unsupported("signUrl");
+  }
+
+  @Override
+  public PostPolicyV4 generateSignedPostPolicyV4(
+      BlobInfo blobInfo,
+      long duration,
+      TimeUnit unit,
+      PostFieldsV4 fields,
+      PostConditionsV4 conditions,
+      PostPolicyV4Option... options) {
+    return unsupported("generateSignedPostPolicyV4");
+  }
+
+  @Override
+  public PostPolicyV4 generateSignedPostPolicyV4(
+      BlobInfo blobInfo,
+      long duration,
+      TimeUnit unit,
+      PostFieldsV4 fields,
+      PostPolicyV4Option... options) {
+    return unsupported("generateSignedPostPolicyV4");
+  }
+
+  @Override
+  public PostPolicyV4 generateSignedPostPolicyV4(
+      BlobInfo blobInfo,
+      long duration,
+      TimeUnit unit,
+      PostConditionsV4 conditions,
+      PostPolicyV4Option... options) {
+    return unsupported("generateSignedPostPolicyV4");
+  }
+
+  @Override
+  public PostPolicyV4 generateSignedPostPolicyV4(
+      BlobInfo blobInfo, long duration, TimeUnit unit, PostPolicyV4Option... options) {
+    return unsupported("generateSignedPostPolicyV4");
+  }
+
+  @Override
+  public List<Blob> get(BlobId... blobIds) {
+    return unsupported("get(BlobId...)");
+  }
+
+  @Override
+  public List<Blob> get(Iterable<BlobId> blobIds) {
+    return unsupported("get(Iterable)");
+  }
+
+  @Override
+  public List<Blob> update(BlobInfo... blobInfos) {
+    return unsupported("update(BlobInfo...)");
+  }
+
+  @Override
+  public List<Blob> update(Iterable<BlobInfo> blobInfos) {
+    return unsupported("update(Iterable)");
+  }
+
+  @Override
+  public List<Boolean> delete(BlobId... blobIds) {
+    return unsupported("delete(BlobId...)");
+  }
+
+  @Override
+  public List<Boolean> delete(Iterable<BlobId> blobIds) {
+    return unsupported("delete(Iterable)");
+  }
+
+  @Override
+  public Acl getAcl(String bucket, Entity entity, BucketSourceOption... options) {
+    return unsupported("getAcl");
+  }
+
+  @Override
+  public Acl getAcl(String bucket, Entity entity) {
+    return unsupported("getAcl");
+  }
+
+  @Override
+  public boolean deleteAcl(String bucket, Entity entity, BucketSourceOption... options) {
+    return unsupported("deleteAcl");
+  }
+
+  @Override
+  public boolean deleteAcl(String bucket, Entity entity) {
+    return unsupported("deleteAcl");
+  }
+
+  @Override
+  public Acl createAcl(String bucket, Acl acl, BucketSourceOption... options) {
+    return unsupported("createAcl");
+  }
+
+  @Override
+  public Acl createAcl(String bucket, Acl acl) {
+    return unsupported("createAcl");
+  }
+
+  @Override
+  public Acl updateAcl(String bucket, Acl acl, BucketSourceOption... options) {
+    return unsupported("updateAcl");
+  }
+
+  @Override
+  public Acl updateAcl(String bucket, Acl acl) {
+    return unsupported("updateAcl");
+  }
+
+  @Override
+  public List<Acl> listAcls(String bucket, BucketSourceOption... options) {
+    return unsupported("listAcls");
+  }
+
+  @Override
+  public List<Acl> listAcls(String bucket) {
+    return unsupported("listAcls");
+  }
+
+  @Override
+  public Acl getDefaultAcl(String bucket, Entity entity) {
+    return unsupported("getDefaultAcl");
+  }
+
+  @Override
+  public boolean deleteDefaultAcl(String bucket, Entity entity) {
+    return unsupported("deleteDefaultAcl");
+  }
+
+  @Override
+  public Acl createDefaultAcl(String bucket, Acl acl) {
+    return unsupported("createDefaultAcl");
+  }
+
+  @Override
+  public Acl updateDefaultAcl(String bucket, Acl acl) {
+    return unsupported("updateDefaultAcl");
+  }
+
+  @Override
+  public List<Acl> listDefaultAcls(String bucket) {
+    return unsupported("listDefaultAcls");
+  }
+
+  @Override
+  public Acl getAcl(BlobId blob, Entity entity) {
+    return unsupported("getAcl");
+  }
+
+  @Override
+  public boolean deleteAcl(BlobId blob, Entity entity) {
+    return unsupported("deleteAcl");
+  }
+
+  @Override
+  public Acl createAcl(BlobId blob, Acl acl) {
+    return unsupported("createAcl");
+  }
+
+  @Override
+  public Acl updateAcl(BlobId blob, Acl acl) {
+    return unsupported("updateAcl");
+  }
+
+  @Override
+  public List<Acl> listAcls(BlobId blob) {
+    return unsupported("listAcls");
+  }
+
+  @Override
+  public HmacKey createHmacKey(ServiceAccount serviceAccount, CreateHmacKeyOption... options) {
+    return unsupported("createHmacKey");
+  }
+
+  @Override
+  public Page<HmacKeyMetadata> listHmacKeys(ListHmacKeysOption... options) {
+    return unsupported("listHmacKeys");
+  }
+
+  @Override
+  public HmacKeyMetadata getHmacKey(String accessId, GetHmacKeyOption... options) {
+    return unsupported("getHmacKey");
+  }
+
+  @Override
+  public void deleteHmacKey(HmacKeyMetadata hmacKeyMetadata, DeleteHmacKeyOption... options) {
+    unsupported("deleteHmacKey");
+  }
+
+  @Override
+  public HmacKeyMetadata updateHmacKeyState(
+      HmacKeyMetadata hmacKeyMetadata,
+      HmacKey.HmacKeyState state,
+      UpdateHmacKeyOption... options) {
+    return unsupported("updateHmacKeyState");
+  }
+
+  @Override
+  public Policy getIamPolicy(String bucket, BucketSourceOption... options) {
+    return unsupported("getIamPolicy");
+  }
+
+  @Override
+  public Policy setIamPolicy(String bucket, Policy policy, BucketSourceOption... options) {
+    return unsupported("setIamPolicy");
+  }
+
+  @Override
+  public List<Boolean> testIamPermissions(
+      String bucket, List<String> permissions, BucketSourceOption... options) {
+    return unsupported("testIamPermissions");
+  }
+
+  @Override
+  public ServiceAccount getServiceAccount(String projectId) {
+    return unsupported("getServiceAccount");
+  }
+
+  @Override
+  public Notification createNotification(String bucket, NotificationInfo notificationInfo) {
+    return unsupported("createNotification");
+  }
+
+  @Override
+  public Notification getNotification(String bucket, String notificationId) {
+    return unsupported("getNotification");
+  }
+
+  @Override
+  public List<Notification> listNotifications(String bucket) {
+    return unsupported("listNotifications");
+  }
+
+  @Override
+  public boolean deleteNotification(String bucket, String notificationId) {
+    return unsupported("deleteNotification");
+  }
+
+  @Override
+  public BlobWriteSession blobWriteSession(BlobInfo blobInfo, BlobWriteOption... options) {
+    return unsupported("blobWriteSession");
+  }
+
+  @Override
+  public Blob moveBlob(MoveBlobRequest request) {
+    return unsupported("moveBlob");
+  }
+}
