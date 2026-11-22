@@ -16,12 +16,16 @@
 
 package com.google.cloud.storage;
 
+import com.google.cloud.BaseServiceException;
 import com.google.common.io.BaseEncoding;
 import com.google.common.primitives.Ints;
 import com.google.storage.v2.ListBucketsRequest;
 import com.google.storage.v2.ListObjectsRequest;
 import com.google.storage.v2.ReadObjectRequest;
 import com.google.storage.v2.WriteObjectRequest;
+import io.grpc.Status;
+import io.grpc.StatusException;
+import io.grpc.StatusRuntimeException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -165,5 +169,30 @@ public final class UdsPackageBridge {
     return req.getWriteObjectSpec().hasIfGenerationMatch()
         ? OptionalLong.of(req.getWriteObjectSpec().getIfGenerationMatch())
         : OptionalLong.empty();
+  }
+
+  /**
+   * Translates gRPC-over-UDS {@link StatusRuntimeException} / {@link StatusException} errors into
+   * {@link StorageException}s carrying the SDK's canonical HTTP status code mapping.
+   */
+  public static StorageException toStorageException(Throwable t) {
+    if (t instanceof StorageException) {
+      return (StorageException) t;
+    }
+    if (t instanceof StatusRuntimeException
+        || t instanceof StatusException
+        || t.getCause() instanceof StatusRuntimeException
+        || t.getCause() instanceof StatusException) {
+      Status status = Status.fromThrowable(t);
+      int httpCode = GrpcToHttpStatusCodeTranslation.grpcCodeToHttpStatusCode(status.getCode());
+      String message =
+          status.getDescription() != null ? status.getDescription() : status.getCode().name();
+      return new StorageException(httpCode, message, status.getCode().name(), t);
+    }
+    BaseServiceException coalesced = StorageException.coalesce(t);
+    if (coalesced instanceof StorageException) {
+      return (StorageException) coalesced;
+    }
+    return new StorageException(coalesced.getCode(), coalesced.getMessage(), coalesced);
   }
 }

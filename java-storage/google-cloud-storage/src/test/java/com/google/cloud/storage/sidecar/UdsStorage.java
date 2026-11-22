@@ -19,6 +19,7 @@ package com.google.cloud.storage.sidecar;
 import static java.util.Objects.requireNonNull;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.paging.Page;
 import com.google.cloud.Policy;
 import com.google.cloud.ReadChannel;
@@ -42,16 +43,26 @@ import com.google.cloud.storage.NotificationInfo;
 import com.google.cloud.storage.PostPolicyV4;
 import com.google.cloud.storage.PostPolicyV4.PostConditionsV4;
 import com.google.cloud.storage.PostPolicyV4.PostFieldsV4;
+import com.google.cloud.storage.ReadProjectionConfig;
 import com.google.cloud.storage.ServiceAccount;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageBatch;
+import com.google.cloud.storage.StorageException;
 import com.google.cloud.storage.StorageOptions;
+import com.google.cloud.storage.UdsPackageBridge;
+import com.google.cloud.storage.sidecar.proto.CloseObjectRequest;
 import com.google.cloud.storage.sidecar.proto.Empty;
 import com.google.cloud.storage.sidecar.proto.GcsCoreGrpc;
+import com.google.cloud.storage.sidecar.proto.ObjectMeta;
+import com.google.cloud.storage.sidecar.proto.OpenObjectRequest;
+import com.google.cloud.storage.sidecar.proto.OpenObjectResponse;
 import com.google.cloud.storage.sidecar.proto.StatsRequest;
 import com.google.cloud.storage.sidecar.proto.StatsResponse;
+import com.google.common.util.concurrent.MoreExecutors;
 import io.grpc.Channel;
 import io.grpc.ClientInterceptors;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -114,6 +125,7 @@ public final class UdsStorage implements Storage {
     private UdsTransport transport = UdsTransport.GRPC;
     private String socketPath;
     private String sidecarBinaryPath;
+    private UdsServerRuntime customRuntime;
     private long startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS;
 
     private Builder(StorageOptions baseOptions) {
@@ -140,6 +152,12 @@ public final class UdsStorage implements Storage {
       return this;
     }
 
+    Builder setServerRuntime(UdsServerRuntime customRuntime) {
+      this.customRuntime = requireNonNull(customRuntime, "customRuntime");
+      this.socketPath = customRuntime.socketPath();
+      return this;
+    }
+
     public Builder setStartupTimeoutMs(long startupTimeoutMs) {
       this.startupTimeoutMs = startupTimeoutMs;
       return this;
@@ -151,7 +169,8 @@ public final class UdsStorage implements Storage {
               ? UdsServerRuntime.newUniqueSocketPath()
               : socketPath;
 
-      UdsServerRuntime runtime = createRuntime(resolvedSocket);
+      UdsServerRuntime runtime =
+          customRuntime != null ? customRuntime : createRuntime(resolvedSocket);
       UdsChannelFactory.ChannelHandle chHandle = null;
       GcsSessionManager sessMgr = null;
       boolean ok = false;
@@ -269,9 +288,134 @@ public final class UdsStorage implements Storage {
   // 6 POC Veneer APIs — implemented step by step in Steps 1–7
   // ---------------------------------------------------------------------------
 
+  private void ensureOpen() {
+    if (closed.get()) {
+      throw new IllegalStateException("UdsStorage client is closed");
+    }
+  }
+
   @Override
   public ApiFuture<BlobReadSession> blobReadSession(BlobId id, BlobSourceOption... options) {
-    return unsupported("blobReadSession (implemented in Step 1 / WL1)");
+    requireNonNull(id, "id");
+    ensureOpen();
+    if (transport != UdsTransport.GRPC) {
+      throw new UnsupportedOperationException(
+          "blobReadSession is only supported when UdsTransport is GRPC");
+    }
+
+    OpenObjectRequest.Builder reqBuilder =
+        OpenObjectRequest.newBuilder().setBucket(id.getBucket()).setObject(id.getName());
+    if (id.getGeneration() != null && id.getGeneration() > 0) {
+      reqBuilder.setGeneration(id.getGeneration());
+    }
+
+    final SettableApiFuture<BlobReadSession> future = SettableApiFuture.create();
+    asyncStub.openObject(
+        reqBuilder.build(),
+        new ClientResponseObserver<OpenObjectRequest, OpenObjectResponse>() {
+          @Override
+          public void beforeStart(
+              final ClientCallStreamObserver<OpenObjectRequest> requestStream) {
+            future.addListener(
+                () -> {
+                  if (future.isCancelled()) {
+                    requestStream.cancel("ApiFuture cancelled by caller", null);
+                  }
+                },
+                MoreExecutors.directExecutor());
+          }
+
+          @Override
+          public void onNext(OpenObjectResponse resp) {
+            ObjectMeta meta = resp.getMeta();
+            long resolvedGen =
+                meta.getGeneration() > 0
+                    ? meta.getGeneration()
+                    : (id.getGeneration() != null ? id.getGeneration() : 0L);
+            BlobInfo info =
+                UdsPackageBridge.buildBlobInfo(
+                    id.getBucket(),
+                    id.getName(),
+                    resolvedGen,
+                    meta.getSize(),
+                    meta.getMetageneration(),
+                    meta.getContentType(),
+                    meta.getContentEncoding(),
+                    "",
+                    0L,
+                    meta.getCrc32C());
+            UdsBlobReadSession session = new UdsBlobReadSession(resp.getHandle(), info);
+            if (!future.set(session)) {
+              session.closeQuietly();
+            }
+          }
+
+          @Override
+          public void onError(Throwable t) {
+            future.setException(UdsPackageBridge.toStorageException(t));
+          }
+
+          @Override
+          public void onCompleted() {
+            if (!future.isDone()) {
+              future.setException(
+                  new StorageException(
+                      500, "GcsCore.OpenObject completed without returning OpenObjectResponse"));
+            }
+          }
+        });
+    return future;
+  }
+
+  /**
+   * Thin {@link BlobReadSession} implementation forwarding session lifecycle and range reads to
+   * {@code GcsCore.OpenObject}, {@code GcsCore.ReadRange}, and {@code GcsCore.CloseObject}.
+   */
+  private final class UdsBlobReadSession implements BlobReadSession {
+    private final long handle;
+    private final BlobInfo blobInfo;
+    private final AtomicBoolean sessionClosed = new AtomicBoolean(false);
+
+    UdsBlobReadSession(long handle, BlobInfo blobInfo) {
+      this.handle = handle;
+      this.blobInfo = blobInfo;
+    }
+
+    @Override
+    public BlobInfo getBlobInfo() {
+      return blobInfo;
+    }
+
+    @Override
+    public <Projection> Projection readAs(ReadProjectionConfig<Projection> config) {
+      requireNonNull(config, "config");
+      if (sessionClosed.get()) {
+        throw new IllegalStateException("BlobReadSession is already closed");
+      }
+      return unsupported("UdsBlobReadSession.readAs (implemented in Step 2 / WL2)");
+    }
+
+    @Override
+    public void close() throws IOException {
+      if (!sessionClosed.compareAndSet(false, true)) {
+        return;
+      }
+      try {
+        blockingStub
+            .withDeadlineAfter(30, TimeUnit.SECONDS)
+            .closeObject(CloseObjectRequest.newBuilder().setHandle(handle).build());
+      } catch (RuntimeException e) {
+        throw new IOException("Failed to close UDS object handle " + handle, e);
+      }
+    }
+
+    void closeQuietly() {
+      try {
+        close();
+      } catch (IOException ignored) {
+        // Best-effort cleanup when caller cancelled open future mid-flight.
+      }
+    }
   }
 
   @Override

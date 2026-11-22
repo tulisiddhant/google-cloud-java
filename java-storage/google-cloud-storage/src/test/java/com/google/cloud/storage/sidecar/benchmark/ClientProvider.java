@@ -50,6 +50,14 @@ public final class ClientProvider implements AutoCloseable {
     this.udsStorage = udsStorage;
   }
 
+  /** Wraps an existing client instance for hermetic workload unit tests. */
+  public static ClientProvider forSingleClient(BenchmarkConfig config, Storage client) {
+    requireNonNull(config, "config");
+    requireNonNull(client, "client");
+    UdsStorage uds = (client instanceof UdsStorage) ? (UdsStorage) client : null;
+    return new ClientProvider(config, Collections.singletonList(client), uds);
+  }
+
   /** Instantiates and pre-warms the driver clients specified by {@code config}. */
   public static ClientProvider create(BenchmarkConfig config) throws IOException {
     requireNonNull(config, "config");
