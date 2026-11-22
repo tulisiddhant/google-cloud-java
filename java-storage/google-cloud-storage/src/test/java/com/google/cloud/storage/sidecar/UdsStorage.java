@@ -19,10 +19,12 @@ package com.google.cloud.storage.sidecar;
 import static java.util.Objects.requireNonNull;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
 import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.paging.Page;
 import com.google.cloud.Policy;
 import com.google.cloud.ReadChannel;
+import com.google.cloud.RestorableState;
 import com.google.cloud.WriteChannel;
 import com.google.cloud.storage.Acl;
 import com.google.cloud.storage.Acl.Entity;
@@ -43,6 +45,8 @@ import com.google.cloud.storage.NotificationInfo;
 import com.google.cloud.storage.PostPolicyV4;
 import com.google.cloud.storage.PostPolicyV4.PostConditionsV4;
 import com.google.cloud.storage.PostPolicyV4.PostFieldsV4;
+import com.google.cloud.storage.RangeSpec;
+import com.google.cloud.storage.ReadAsFutureBytes;
 import com.google.cloud.storage.ReadProjectionConfig;
 import com.google.cloud.storage.ServiceAccount;
 import com.google.cloud.storage.Storage;
@@ -56,20 +60,32 @@ import com.google.cloud.storage.sidecar.proto.GcsCoreGrpc;
 import com.google.cloud.storage.sidecar.proto.ObjectMeta;
 import com.google.cloud.storage.sidecar.proto.OpenObjectRequest;
 import com.google.cloud.storage.sidecar.proto.OpenObjectResponse;
+import com.google.cloud.storage.sidecar.proto.ReadChunk;
+import com.google.cloud.storage.sidecar.proto.ReadObjectRequest;
+import com.google.cloud.storage.sidecar.proto.ReadRangeRequest;
 import com.google.cloud.storage.sidecar.proto.StatsRequest;
 import com.google.cloud.storage.sidecar.proto.StatsResponse;
 import com.google.common.util.concurrent.MoreExecutors;
+import com.google.protobuf.ByteString;
 import io.grpc.Channel;
 import io.grpc.ClientInterceptors;
+import io.grpc.Context;
+import io.grpc.Status;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Iterator;
 import java.util.List;
 import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -375,6 +391,7 @@ public final class UdsStorage implements Storage {
     private final long handle;
     private final BlobInfo blobInfo;
     private final AtomicBoolean sessionClosed = new AtomicBoolean(false);
+    private final Set<SettableApiFuture<?>> inflightReads = ConcurrentHashMap.newKeySet();
 
     UdsBlobReadSession(long handle, BlobInfo blobInfo) {
       this.handle = handle;
@@ -387,12 +404,108 @@ public final class UdsStorage implements Storage {
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public <Projection> Projection readAs(ReadProjectionConfig<Projection> config) {
       requireNonNull(config, "config");
       if (sessionClosed.get()) {
         throw new IllegalStateException("BlobReadSession is already closed");
       }
-      return unsupported("UdsBlobReadSession.readAs (implemented in Step 2 / WL2)");
+      if (config instanceof ReadAsFutureBytes) {
+        RangeSpec range = ((ReadAsFutureBytes) config).getRange();
+        return (Projection) readRangeAsFutureBytes(range);
+      }
+      return unsupported("UdsBlobReadSession.readAs(" + config.getClass().getSimpleName() + ")");
+    }
+
+    private ApiFuture<byte[]> readRangeAsFutureBytes(RangeSpec range) {
+      long offset = range.begin();
+      OptionalLong maxLenOpt = range.maxLength();
+      if (maxLenOpt.isPresent() && maxLenOpt.getAsLong() == 0L) {
+        return ApiFutures.immediateFuture(new byte[0]);
+      }
+
+      long requestedLen = maxLenOpt.isPresent() ? maxLenOpt.getAsLong() : -1L;
+      int initialCapacity = computeInitialCapacity(offset, maxLenOpt);
+
+      ReadRangeRequest req =
+          ReadRangeRequest.newBuilder()
+              .setHandle(handle)
+              .setOffset(offset)
+              .setLength(requestedLen)
+              .build();
+
+      final SettableApiFuture<byte[]> future = SettableApiFuture.create();
+      inflightReads.add(future);
+      future.addListener(() -> inflightReads.remove(future), MoreExecutors.directExecutor());
+
+      if (sessionClosed.get()) {
+        future.setException(new IOException("BlobReadSession closed"));
+        return future;
+      }
+
+      asyncStub.readRange(
+          req,
+          new ClientResponseObserver<ReadRangeRequest, ReadChunk>() {
+            private byte[] buffer =
+                initialCapacity > 0 ? new byte[initialCapacity] : new byte[64 * 1024];
+            private int writePos = 0;
+
+            @Override
+            public void beforeStart(
+                final ClientCallStreamObserver<ReadRangeRequest> requestStream) {
+              future.addListener(
+                  () -> {
+                    if (future.isCancelled()) {
+                      requestStream.cancel("Range read cancelled", null);
+                    }
+                  },
+                  MoreExecutors.directExecutor());
+            }
+
+            @Override
+            public void onNext(ReadChunk chunk) {
+              List<ByteString> slices = chunk.getDataList();
+              for (int i = 0; i < slices.size(); i++) {
+                ByteString slice = slices.get(i);
+                int len = slice.size();
+                if (len == 0) {
+                  continue;
+                }
+                if (writePos + len > buffer.length) {
+                  int nextCap = Math.max(buffer.length * 2, writePos + len);
+                  buffer = Arrays.copyOf(buffer, nextCap);
+                }
+                slice.copyTo(buffer, writePos);
+                writePos += len;
+              }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+              future.setException(UdsPackageBridge.toStorageException(t));
+            }
+
+            @Override
+            public void onCompleted() {
+              byte[] result = (writePos == buffer.length) ? buffer : Arrays.copyOf(buffer, writePos);
+              future.set(result);
+            }
+          });
+      return future;
+    }
+
+    private int computeInitialCapacity(long offset, OptionalLong maxLenOpt) {
+      Long objSize = blobInfo != null ? blobInfo.getSize() : null;
+      long remainingInObj =
+          (objSize != null && objSize > offset) ? (objSize - offset) : Long.MAX_VALUE;
+      long target =
+          maxLenOpt.isPresent()
+              ? Math.min(maxLenOpt.getAsLong(), remainingInObj)
+              : remainingInObj;
+      if (target > 0L && target <= Integer.MAX_VALUE - 8) {
+        return (int) target;
+      }
+      return 0;
     }
 
     @Override
@@ -400,6 +513,10 @@ public final class UdsStorage implements Storage {
       if (!sessionClosed.compareAndSet(false, true)) {
         return;
       }
+      for (SettableApiFuture<?> pending : inflightReads) {
+        pending.setException(new IOException("BlobReadSession closed while range read was active"));
+      }
+      inflightReads.clear();
       try {
         blockingStub
             .withDeadlineAfter(30, TimeUnit.SECONDS)
@@ -425,7 +542,233 @@ public final class UdsStorage implements Storage {
 
   @Override
   public ReadChannel reader(BlobId blob, BlobSourceOption... options) {
-    return unsupported("reader (implemented in Step 2 / WL2)");
+    requireNonNull(blob, "blob");
+    ensureOpen();
+    OptionalLong ifGenMatch = UdsPackageBridge.extractSourceIfGenerationMatch(blob, options);
+    return new UdsReadChannel(blob, ifGenMatch);
+  }
+
+  /**
+   * Thin {@link ReadChannel} forwarding unidirectional range and full-object reads to {@code
+   * GcsCore.ReadObject} with explicit {@link Context.CancellableContext} stream cancellation on
+   * {@link #close()}.
+   */
+  private final class UdsReadChannel implements ReadChannel {
+    private final BlobId blobId;
+    private final OptionalLong ifGenerationMatch;
+
+    private long position = 0L;
+    private long endLimit = Long.MAX_VALUE;
+    private int chunkSize = 0;
+    private boolean channelOpen = true;
+
+    private Context.CancellableContext streamCtx;
+    private Iterator<ReadChunk> chunkIterator;
+    private List<ByteString> currentSlices;
+    private int sliceIndex;
+    private int sliceOffset;
+    private boolean streamEof;
+
+    UdsReadChannel(BlobId blobId, OptionalLong ifGenerationMatch) {
+      this.blobId = blobId;
+      this.ifGenerationMatch = ifGenerationMatch;
+    }
+
+    @Override
+    public synchronized boolean isOpen() {
+      return channelOpen;
+    }
+
+    @Override
+    public synchronized void seek(long newPosition) throws IOException {
+      if (!channelOpen) {
+        throw new ClosedChannelException();
+      }
+      if (newPosition < 0L) {
+        throw new IllegalArgumentException("seek position must be >= 0, got: " + newPosition);
+      }
+      if (newPosition != this.position) {
+        cancelActiveStream();
+        this.position = newPosition;
+        this.streamEof = false;
+      }
+    }
+
+    @Override
+    public synchronized ReadChannel limit(long newLimit) {
+      if (newLimit < 0L) {
+        throw new IllegalArgumentException("limit must be >= 0, got: " + newLimit);
+      }
+      if (newLimit != this.endLimit) {
+        cancelActiveStream();
+        this.endLimit = newLimit;
+        this.streamEof = false;
+      }
+      return this;
+    }
+
+    @Override
+    public synchronized long limit() {
+      return endLimit;
+    }
+
+    @Override
+    public synchronized void setChunkSize(int chunkSize) {
+      this.chunkSize = Math.max(0, chunkSize);
+    }
+
+    @Override
+    public RestorableState<ReadChannel> capture() {
+      return unsupported("UdsReadChannel.capture");
+    }
+
+    @Override
+    public synchronized int read(ByteBuffer dst) throws IOException {
+      requireNonNull(dst, "dst");
+      if (!channelOpen) {
+        throw new ClosedChannelException();
+      }
+      if (endLimit != Long.MAX_VALUE && position >= endLimit) {
+        return -1;
+      }
+      if (!dst.hasRemaining()) {
+        return 0;
+      }
+      if (streamEof) {
+        return -1;
+      }
+
+      try {
+        if (chunkIterator == null) {
+          openStream();
+        }
+
+        int totalCopied = 0;
+        while (dst.hasRemaining()) {
+          ByteString activeSlice = nextNonEmptySlice(totalCopied == 0);
+          if (activeSlice == null) {
+            if (totalCopied > 0) {
+              return totalCopied;
+            }
+            streamEof = true;
+            cancelActiveStream();
+            return -1;
+          }
+
+          long maxByLimit =
+              (endLimit == Long.MAX_VALUE) ? Long.MAX_VALUE : Math.max(0L, endLimit - position);
+          if (maxByLimit == 0L) {
+            cancelActiveStream();
+            return totalCopied > 0 ? totalCopied : -1;
+          }
+
+          int availableInSlice = activeSlice.size() - sliceOffset;
+          int toCopy = (int) Math.min(Math.min(dst.remaining(), availableInSlice), maxByLimit);
+
+          ByteBuffer ro = activeSlice.asReadOnlyByteBuffer();
+          ro.position(sliceOffset);
+          ro.limit(sliceOffset + toCopy);
+          dst.put(ro);
+
+          sliceOffset += toCopy;
+          position += toCopy;
+          totalCopied += toCopy;
+
+          if (sliceOffset >= activeSlice.size()) {
+            sliceIndex++;
+            sliceOffset = 0;
+          }
+          if (endLimit != Long.MAX_VALUE && position >= endLimit) {
+            cancelActiveStream();
+            return totalCopied;
+          }
+        }
+        return totalCopied;
+      } catch (RuntimeException e) {
+        cancelActiveStream();
+        if (Status.fromThrowable(e).getCode() == Status.Code.OUT_OF_RANGE) {
+          streamEof = true;
+          return -1;
+        }
+        throw new IOException(UdsPackageBridge.toStorageException(e));
+      }
+    }
+
+    private void openStream() {
+      long reqLength = (endLimit == Long.MAX_VALUE) ? -1L : (endLimit - position);
+      ReadObjectRequest.Builder reqB =
+          ReadObjectRequest.newBuilder()
+              .setBucket(blobId.getBucket())
+              .setObject(blobId.getName())
+              .setOffset(position)
+              .setLength(reqLength)
+              .setTransport(transport.toProto())
+              .setChunkSize(chunkSize > 0 ? chunkSize : 0);
+      if (blobId.getGeneration() != null && blobId.getGeneration() > 0) {
+        reqB.setGeneration(blobId.getGeneration());
+      }
+      if (ifGenerationMatch.isPresent()) {
+        reqB.setIfGenerationMatch(ifGenerationMatch.getAsLong());
+      }
+      ReadObjectRequest req = reqB.build();
+      streamCtx = Context.current().withCancellation();
+      Context prev = streamCtx.attach();
+      try {
+        chunkIterator = blockingStub.readObject(req);
+      } finally {
+        streamCtx.detach(prev);
+      }
+      currentSlices = null;
+      sliceIndex = 0;
+      sliceOffset = 0;
+    }
+
+    private ByteString nextNonEmptySlice(boolean blockForNextChunk) {
+      while (true) {
+        if (currentSlices != null) {
+          while (sliceIndex < currentSlices.size()) {
+            ByteString candidate = currentSlices.get(sliceIndex);
+            if (sliceOffset < candidate.size()) {
+              return candidate;
+            }
+            sliceIndex++;
+            sliceOffset = 0;
+          }
+          currentSlices = null;
+        }
+        if (!blockForNextChunk) {
+          return null;
+        }
+        if (chunkIterator == null || !chunkIterator.hasNext()) {
+          return null;
+        }
+        ReadChunk nextChunk = chunkIterator.next();
+        currentSlices = nextChunk.getDataList();
+        sliceIndex = 0;
+        sliceOffset = 0;
+      }
+    }
+
+    private void cancelActiveStream() {
+      Context.CancellableContext ctx = this.streamCtx;
+      this.streamCtx = null;
+      this.chunkIterator = null;
+      this.currentSlices = null;
+      this.sliceIndex = 0;
+      this.sliceOffset = 0;
+      if (ctx != null) {
+        ctx.cancel(null);
+      }
+    }
+
+    @Override
+    public synchronized void close() {
+      if (!channelOpen) {
+        return;
+      }
+      channelOpen = false;
+      cancelActiveStream();
+    }
   }
 
   @Override
