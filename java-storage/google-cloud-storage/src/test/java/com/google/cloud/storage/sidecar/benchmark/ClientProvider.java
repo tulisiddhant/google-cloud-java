@@ -52,10 +52,18 @@ public final class ClientProvider implements AutoCloseable {
 
   /** Wraps an existing client instance for hermetic workload unit tests. */
   public static ClientProvider forSingleClient(BenchmarkConfig config, Storage client) {
+    return forSingleClientWithAdmin(config, client, null);
+  }
+
+  /** Wraps an existing client and out-of-band admin client for hermetic cleanup unit tests. */
+  public static ClientProvider forSingleClientWithAdmin(
+      BenchmarkConfig config, Storage client, Storage adminClient) {
     requireNonNull(config, "config");
     requireNonNull(client, "client");
     UdsStorage uds = (client instanceof UdsStorage) ? (UdsStorage) client : null;
-    return new ClientProvider(config, Collections.singletonList(client), uds);
+    ClientProvider provider = new ClientProvider(config, Collections.singletonList(client), uds);
+    provider.adminClient = adminClient;
+    return provider;
   }
 
   /** Wraps an explicit client pool for hermetic multi-client workload unit tests. */

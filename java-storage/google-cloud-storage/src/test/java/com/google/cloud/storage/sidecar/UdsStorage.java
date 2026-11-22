@@ -65,6 +65,10 @@ import com.google.cloud.storage.sidecar.proto.ReadObjectRequest;
 import com.google.cloud.storage.sidecar.proto.ReadRangeRequest;
 import com.google.cloud.storage.sidecar.proto.StatsRequest;
 import com.google.cloud.storage.sidecar.proto.StatsResponse;
+import com.google.cloud.storage.sidecar.proto.Transport;
+import com.google.cloud.storage.sidecar.proto.WriteHeader;
+import com.google.cloud.storage.sidecar.proto.WriteObjectResponse;
+import com.google.cloud.storage.sidecar.proto.WriteRequest;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
 import io.grpc.Channel;
@@ -75,6 +79,7 @@ import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.URL;
 import java.nio.ByteBuffer;
@@ -86,8 +91,11 @@ import java.util.List;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
  * {@link Storage} veneer implementation backed by the shared Rust {@code gcscore.v1.GcsCore}
@@ -771,15 +779,465 @@ public final class UdsStorage implements Storage {
     }
   }
 
+  /**
+   * Maximum payload slice per {@code WriteRequest(data)} message ({@code 2 MiB}), matching {@code
+   * --chunk-size 2097152} and staying safely below Tonic's {@code 4 MiB} {@code max_frame_size}
+   * after Protobuf + 5-byte gRPC framing.
+   */
+  public static final int WRITE_FRAME_BYTES = 2 * 1024 * 1024;
+
+  private static final long WRITE_FINALIZE_TIMEOUT_SEC = 300L;
+
   @Override
   public BlobAppendableUpload blobAppendableUpload(
       BlobInfo blobInfo, BlobAppendableUploadConfig uploadConfig, BlobWriteOption... options) {
-    return unsupported("blobAppendableUpload (implemented in Step 6 / WL6)");
+    requireNonNull(blobInfo, "blobInfo");
+    requireNonNull(uploadConfig, "uploadConfig");
+    ensureOpen();
+    if (this.transport != UdsTransport.GRPC) {
+      throw new UnsupportedOperationException(
+          "UdsStorage.blobAppendableUpload is supported on GRPC transport only");
+    }
+    OptionalLong ifGenMatch = UdsPackageBridge.extractWriteIfGenerationMatch(blobInfo, options);
+    return new UdsAppendableUpload(blobInfo, uploadConfig, ifGenMatch);
   }
 
   @Override
   public WriteChannel writer(BlobInfo blobInfo, BlobWriteOption... options) {
-    return unsupported("writer (implemented in Step 6 / WL6)");
+    requireNonNull(blobInfo, "blobInfo");
+    ensureOpen();
+    OptionalLong ifGenMatch = UdsPackageBridge.extractWriteIfGenerationMatch(blobInfo, options);
+    return new UdsWriteChannel(blobInfo, ifGenMatch);
+  }
+
+  /**
+   * Flow-controlled client-streaming {@code GcsCore.WriteObject} pump shared by {@link
+   * UdsAppendableUpload} and {@link UdsWriteChannel}.
+   *
+   * <p>Gates every outbound frame on {@link ClientCallStreamObserver#isReady()} with {@code
+   * setOnReadyHandler} + terminal-error wakeup so Netty direct buffers stay strictly bounded across
+   * 48 parallel upload workers and a failed stream never blocks a waiting writer.
+   */
+  private final class UdsWriteStreamPump {
+    private final BlobInfo targetBlobInfo;
+    private final Object sendLock = new Object();
+    private final Object flowLock = new Object();
+    private final SettableApiFuture<BlobInfo> resultFuture;
+
+    private volatile ClientCallStreamObserver<WriteRequest> requestStream;
+    private WriteObjectResponse serverResponse;
+    private StorageException terminalError;
+    private boolean completed;
+    private boolean cancelled;
+
+    UdsWriteStreamPump(
+        BlobInfo targetBlobInfo,
+        Transport wireTransport,
+        OptionalLong ifGenerationMatch,
+        int resumableChunkSize,
+        SettableApiFuture<BlobInfo> resultFuture)
+        throws IOException {
+      this.targetBlobInfo = targetBlobInfo;
+      this.resultFuture = resultFuture;
+
+      asyncStub.writeObject(
+          new ClientResponseObserver<WriteRequest, WriteObjectResponse>() {
+            @Override
+            public void beforeStart(final ClientCallStreamObserver<WriteRequest> reqStream) {
+              requestStream = reqStream;
+              reqStream.setOnReadyHandler(
+                  new Runnable() {
+                    @Override
+                    public void run() {
+                      synchronized (flowLock) {
+                        flowLock.notifyAll();
+                      }
+                    }
+                  });
+            }
+
+            @Override
+            public void onNext(WriteObjectResponse value) {
+              synchronized (flowLock) {
+                serverResponse = value;
+              }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+              StorageException se = UdsPackageBridge.toStorageException(t);
+              synchronized (flowLock) {
+                terminalError = se;
+                completed = true;
+                flowLock.notifyAll();
+              }
+              resultFuture.setException(se);
+            }
+
+            @Override
+            public void onCompleted() {
+              WriteObjectResponse resp;
+              synchronized (flowLock) {
+                resp = serverResponse;
+                completed = true;
+                flowLock.notifyAll();
+              }
+              if (resp == null) {
+                StorageException missing =
+                    new StorageException(0, "WriteObject completed without WriteObjectResponse");
+                synchronized (flowLock) {
+                  terminalError = missing;
+                }
+                resultFuture.setException(missing);
+                return;
+              }
+              BlobInfo finalized =
+                  UdsPackageBridge.buildBlobInfo(
+                      targetBlobInfo.getBucket(),
+                      targetBlobInfo.getName(),
+                      resp.getGeneration(),
+                      resp.getSize(),
+                      0L,
+                      targetBlobInfo.getContentType(),
+                      targetBlobInfo.getContentEncoding(),
+                      targetBlobInfo.getStorageClass() != null
+                          ? targetBlobInfo.getStorageClass().toString()
+                          : null,
+                      0L,
+                      resp.getCrc32C());
+              resultFuture.set(finalized);
+            }
+          });
+
+      // Send initial WriteHeader (leaving known_size unset for streaming veneer fidelity)
+      WriteHeader.Builder hb =
+          WriteHeader.newBuilder()
+              .setBucket(targetBlobInfo.getBucket())
+              .setObject(targetBlobInfo.getName())
+              .setTransport(wireTransport);
+      if (targetBlobInfo.getContentType() != null && !targetBlobInfo.getContentType().isEmpty()) {
+        hb.setContentType(targetBlobInfo.getContentType());
+      }
+      if (ifGenerationMatch.isPresent()) {
+        hb.setIfGenerationMatch(ifGenerationMatch.getAsLong());
+      }
+      if (resumableChunkSize > 0) {
+        hb.setChunkSize(resumableChunkSize);
+      }
+      sendFrame(WriteRequest.newBuilder().setHeader(hb.build()).build());
+    }
+
+    int writeBuffer(ByteBuffer src) throws IOException {
+      int totalWritten = 0;
+      while (src.hasRemaining()) {
+        int frameLen = Math.min(src.remaining(), WRITE_FRAME_BYTES);
+        ByteString payload = copyNextSlice(src, frameLen);
+        sendFrame(WriteRequest.newBuilder().setData(payload).build());
+        totalWritten += frameLen;
+      }
+      return totalWritten;
+    }
+
+    private void sendFrame(WriteRequest msg) throws IOException {
+      synchronized (sendLock) {
+        awaitReadyOrFailed();
+        requestStream.onNext(msg);
+      }
+    }
+
+    private void awaitReadyOrFailed() throws IOException {
+      synchronized (flowLock) {
+        while (!requestStream.isReady() && terminalError == null && !completed && !cancelled) {
+          try {
+            flowLock.wait(250L);
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            InterruptedIOException iio =
+                new InterruptedIOException("Interrupted waiting for UDS write stream readiness");
+            iio.initCause(e);
+            throw iio;
+          }
+        }
+        if (terminalError != null) {
+          throw new IOException(terminalError);
+        }
+        if (cancelled) {
+          throw new ClosedChannelException();
+        }
+        if (completed) {
+          throw new IOException("UDS WriteObject stream closed prematurely by server");
+        }
+      }
+    }
+
+    void throwIfFailed() throws IOException {
+      synchronized (flowLock) {
+        if (terminalError != null) {
+          throw new IOException(terminalError);
+        }
+        if (cancelled) {
+          throw new ClosedChannelException();
+        }
+      }
+    }
+
+    BlobInfo finishAndAwait(long timeoutSec) throws IOException {
+      synchronized (sendLock) {
+        synchronized (flowLock) {
+          if (terminalError != null) {
+            throw new IOException(terminalError);
+          }
+          if (cancelled) {
+            throw new ClosedChannelException();
+          }
+        }
+        requestStream.onCompleted();
+      }
+      try {
+        return resultFuture.get(timeoutSec, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        cancelStream("Upload interrupted");
+        Thread.currentThread().interrupt();
+        InterruptedIOException iio =
+            new InterruptedIOException("Interrupted awaiting WriteObject finalization");
+        iio.initCause(e);
+        throw iio;
+      } catch (TimeoutException e) {
+        cancelStream("Upload timed out awaiting WriteObjectResponse");
+        throw new IOException("Timed out awaiting UDS WriteObject finalization", e);
+      } catch (ExecutionException e) {
+        Throwable cause = e.getCause() != null ? e.getCause() : e;
+        if (cause instanceof IOException) {
+          throw (IOException) cause;
+        }
+        throw new IOException(UdsPackageBridge.toStorageException(cause));
+      }
+    }
+
+    void cancelWithoutFinalizing() {
+      cancelStream("Closed without finalizing");
+      BlobInfo unfinalized = BlobInfo.newBuilder(targetBlobInfo.getBlobId()).build();
+      resultFuture.set(unfinalized);
+    }
+
+    private void cancelStream(String reason) {
+      synchronized (sendLock) {
+        synchronized (flowLock) {
+          if (completed || cancelled) {
+            return;
+          }
+          cancelled = true;
+          flowLock.notifyAll();
+        }
+        if (requestStream != null) {
+          requestStream.cancel(reason, null);
+        }
+      }
+    }
+
+    private ByteString copyNextSlice(ByteBuffer src, int len) {
+      int pos = src.position();
+      if (src.hasArray()) {
+        ByteString bs = ByteString.copyFrom(src.array(), src.arrayOffset() + pos, len);
+        src.position(pos + len);
+        return bs;
+      }
+      ByteBuffer dup = src.slice();
+      dup.limit(len);
+      ByteString bs = ByteString.copyFrom(dup);
+      src.position(pos + len);
+      return bs;
+    }
+  }
+
+  /**
+   * Private inner {@link BlobAppendableUpload} forwarding Zonal Rapid {@code BidiWriteObject}
+   * appendable uploads onto {@code GcsCore.WriteObject(transport = GRPC)}.
+   */
+  private final class UdsAppendableUpload implements BlobAppendableUpload {
+    private final BlobInfo blobInfo;
+    private final BlobAppendableUploadConfig uploadConfig;
+    private final OptionalLong ifGenerationMatch;
+    private final AtomicBoolean opened = new AtomicBoolean(false);
+    private final SettableApiFuture<BlobInfo> resultFuture = SettableApiFuture.create();
+
+    UdsAppendableUpload(
+        BlobInfo blobInfo,
+        BlobAppendableUploadConfig uploadConfig,
+        OptionalLong ifGenerationMatch) {
+      this.blobInfo = blobInfo;
+      this.uploadConfig = uploadConfig;
+      this.ifGenerationMatch = ifGenerationMatch;
+    }
+
+    @Override
+    public AppendableUploadWriteableByteChannel open() throws IOException {
+      ensureOpen();
+      if (!opened.compareAndSet(false, true)) {
+        throw new IllegalStateException("BlobAppendableUpload session may only be opened once");
+      }
+      UdsWriteStreamPump pump =
+          new UdsWriteStreamPump(blobInfo, Transport.GRPC, ifGenerationMatch, 0, resultFuture);
+      return new UdsAppendableChannel(pump);
+    }
+
+    @Override
+    public ApiFuture<BlobInfo> getResult() {
+      return resultFuture;
+    }
+
+    private final class UdsAppendableChannel implements AppendableUploadWriteableByteChannel {
+      private final UdsWriteStreamPump pump;
+      private final AtomicBoolean closingInitiated = new AtomicBoolean(false);
+      private volatile boolean channelOpen = true;
+
+      UdsAppendableChannel(UdsWriteStreamPump pump) {
+        this.pump = pump;
+      }
+
+      @Override
+      public boolean isOpen() {
+        return channelOpen;
+      }
+
+      @Override
+      public int write(ByteBuffer src) throws IOException {
+        requireNonNull(src, "src");
+        if (!channelOpen) {
+          throw new ClosedChannelException();
+        }
+        return pump.writeBuffer(src);
+      }
+
+      @Override
+      public void flush() throws IOException {
+        if (!channelOpen) {
+          throw new ClosedChannelException();
+        }
+        pump.throwIfFailed();
+      }
+
+      @Override
+      public void finalizeAndClose() throws IOException {
+        finalizeAndClose(null);
+      }
+
+      @Override
+      public void finalizeAndClose(@Nullable String expectedCrc32c) throws IOException {
+        if (!closingInitiated.compareAndSet(false, true)) {
+          return;
+        }
+        channelOpen = false;
+        BlobInfo finalized = pump.finishAndAwait(WRITE_FINALIZE_TIMEOUT_SEC);
+        if (expectedCrc32c != null && !expectedCrc32c.equals(finalized.getCrc32c())) {
+          StorageException mismatch =
+              new StorageException(
+                  400,
+                  "CRC32C mismatch: expected "
+                      + expectedCrc32c
+                      + ", got "
+                      + finalized.getCrc32c());
+          throw new IOException(mismatch);
+        }
+      }
+
+      @Override
+      public void closeWithoutFinalizing() {
+        if (!closingInitiated.compareAndSet(false, true)) {
+          return;
+        }
+        channelOpen = false;
+        pump.cancelWithoutFinalizing();
+      }
+
+      @Override
+      public void close() throws IOException {
+        close(null);
+      }
+
+      @Override
+      public void close(@Nullable String expectedCrc32c) throws IOException {
+        if (uploadConfig.getCloseAction()
+            == BlobAppendableUploadConfig.CloseAction.FINALIZE_WHEN_CLOSING) {
+          finalizeAndClose(expectedCrc32c);
+        } else {
+          if (expectedCrc32c != null) {
+            throw new IllegalArgumentException(
+                "expectedCrc32c requires CloseAction.FINALIZE_WHEN_CLOSING");
+          }
+          closeWithoutFinalizing();
+        }
+      }
+    }
+  }
+
+  /**
+   * Private inner {@link WriteChannel} forwarding unknown-length streaming uploads onto {@code
+   * GcsCore.WriteObject} (leaving {@code WriteHeader.known_size} unset).
+   */
+  private final class UdsWriteChannel implements WriteChannel {
+    private final BlobInfo blobInfo;
+    private final OptionalLong ifGenerationMatch;
+    private final SettableApiFuture<BlobInfo> resultFuture = SettableApiFuture.create();
+
+    private int resumableChunkSize = 0;
+    private boolean channelOpen = true;
+    private UdsWriteStreamPump pump;
+
+    UdsWriteChannel(BlobInfo blobInfo, OptionalLong ifGenerationMatch) {
+      this.blobInfo = blobInfo;
+      this.ifGenerationMatch = ifGenerationMatch;
+    }
+
+    @Override
+    public synchronized void setChunkSize(int chunkSize) {
+      this.resumableChunkSize = Math.max(0, chunkSize);
+    }
+
+    @Override
+    public RestorableState<WriteChannel> capture() {
+      return unsupported("UdsWriteChannel.capture");
+    }
+
+    @Override
+    public synchronized boolean isOpen() {
+      return channelOpen;
+    }
+
+    @Override
+    public synchronized int write(ByteBuffer src) throws IOException {
+      requireNonNull(src, "src");
+      if (!channelOpen) {
+        throw new ClosedChannelException();
+      }
+      if (!src.hasRemaining()) {
+        return 0;
+      }
+      ensurePumpStarted();
+      return pump.writeBuffer(src);
+    }
+
+    @Override
+    public synchronized void close() throws IOException {
+      if (!channelOpen) {
+        return;
+      }
+      channelOpen = false;
+      ensurePumpStarted();
+      pump.finishAndAwait(WRITE_FINALIZE_TIMEOUT_SEC);
+    }
+
+    private void ensurePumpStarted() throws IOException {
+      if (pump == null) {
+        pump =
+            new UdsWriteStreamPump(
+                blobInfo,
+                transport.toProto(),
+                ifGenerationMatch,
+                resumableChunkSize,
+                resultFuture);
+      }
+    }
   }
 
   @Override
