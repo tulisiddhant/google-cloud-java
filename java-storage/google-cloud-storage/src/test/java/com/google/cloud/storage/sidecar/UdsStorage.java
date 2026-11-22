@@ -157,6 +157,7 @@ public final class UdsStorage implements Storage {
     private UdsTransport transport = UdsTransport.GRPC;
     private String socketPath;
     private String sidecarBinaryPath;
+    private String inprocLibraryPath;
     private UdsServerRuntime customRuntime;
     private long startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS;
 
@@ -181,6 +182,11 @@ public final class UdsStorage implements Storage {
 
     public Builder setSidecarBinaryPath(String sidecarBinaryPath) {
       this.sidecarBinaryPath = sidecarBinaryPath;
+      return this;
+    }
+
+    public Builder setInprocLibraryPath(String inprocLibraryPath) {
+      this.inprocLibraryPath = inprocLibraryPath;
       return this;
     }
 
@@ -239,7 +245,7 @@ public final class UdsStorage implements Storage {
     private UdsServerRuntime createRuntime(String resolvedSocket) {
       if (driverMode == DriverMode.SIDECAR) {
         String bin =
-            sidecarBinaryPath != null
+            (sidecarBinaryPath != null && !sidecarBinaryPath.isEmpty())
                 ? sidecarBinaryPath
                 : System.getProperty("uds.sidecar.bin", "");
         if (bin.isEmpty()) {
@@ -247,6 +253,17 @@ public final class UdsStorage implements Storage {
               "sidecarBinaryPath must be set via Builder or -Duds.sidecar.bin for SIDECAR mode");
         }
         return new SidecarServerRuntime(bin, resolvedSocket);
+      }
+      if (driverMode == DriverMode.INPROC) {
+        String lib =
+            (inprocLibraryPath != null && !inprocLibraryPath.isEmpty())
+                ? inprocLibraryPath
+                : System.getProperty("uds.inproc.lib", "");
+        if (lib.isEmpty()) {
+          throw new IllegalArgumentException(
+              "inprocLibraryPath must be set via Builder or -Duds.inproc.lib for INPROC mode");
+        }
+        return new InprocServerRuntime(lib, resolvedSocket);
       }
       throw new UnsupportedOperationException("Unsupported DriverMode: " + driverMode);
     }

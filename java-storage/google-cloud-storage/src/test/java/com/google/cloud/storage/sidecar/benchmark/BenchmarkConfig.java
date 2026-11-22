@@ -37,7 +37,8 @@ public final class BenchmarkConfig {
   /** Client driver under test. */
   public enum DriverType {
     NATIVE("native"),
-    UDS_SIDECAR("uds-sidecar");
+    UDS_SIDECAR("uds-sidecar"),
+    UDS_INPROC("uds-inproc");
 
     private final String cliName;
 
@@ -92,6 +93,7 @@ public final class BenchmarkConfig {
   private final int nativePoolSize;
   private final int quiescenceSec;
   private final String sidecarBinaryPath;
+  private final String inprocLibraryPath;
   private final String socketPath;
   private final Set<String> workloadFilter;
   private final String outputJsonPath;
@@ -108,6 +110,7 @@ public final class BenchmarkConfig {
     this.nativePoolSize = b.nativePoolSize;
     this.quiescenceSec = b.quiescenceSec;
     this.sidecarBinaryPath = b.sidecarBinaryPath;
+    this.inprocLibraryPath = b.inprocLibraryPath;
     this.socketPath = b.socketPath;
     this.workloadFilter = Collections.unmodifiableSet(new LinkedHashSet<String>(b.workloadFilter));
     this.outputJsonPath = b.outputJsonPath;
@@ -164,6 +167,9 @@ public final class BenchmarkConfig {
         case "sidecar-bin":
           b.setSidecarBinaryPath(val);
           break;
+        case "inproc-lib":
+          b.setInprocLibraryPath(val);
+          break;
         case "socket-path":
           b.setSocketPath(val);
           break;
@@ -214,6 +220,10 @@ public final class BenchmarkConfig {
     return sidecarBinaryPath;
   }
 
+  public String inprocLibraryPath() {
+    return inprocLibraryPath;
+  }
+
   public String socketPath() {
     return socketPath;
   }
@@ -249,6 +259,7 @@ public final class BenchmarkConfig {
         Integer.getInteger("gcs.native.channel.pool.size", DEFAULT_NATIVE_POOL_SIZE);
     private int quiescenceSec = DEFAULT_QUIESCENCE_SEC;
     private String sidecarBinaryPath = System.getProperty("uds.sidecar.bin", "");
+    private String inprocLibraryPath = System.getProperty("uds.inproc.lib", "");
     private String socketPath = System.getProperty("uds.socket.path", "");
     private final Set<String> workloadFilter = new LinkedHashSet<String>();
     private String outputJsonPath = "";
@@ -292,6 +303,11 @@ public final class BenchmarkConfig {
 
     public Builder setSidecarBinaryPath(String sidecarBinaryPath) {
       this.sidecarBinaryPath = sidecarBinaryPath;
+      return this;
+    }
+
+    public Builder setInprocLibraryPath(String inprocLibraryPath) {
+      this.inprocLibraryPath = inprocLibraryPath;
       return this;
     }
 

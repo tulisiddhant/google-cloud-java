@@ -18,6 +18,7 @@ package com.google.cloud.storage.sidecar.benchmark;
 
 import static java.util.Objects.requireNonNull;
 
+import com.google.cloud.storage.sidecar.DriverMode;
 import com.google.cloud.storage.sidecar.UdsStorage;
 import com.google.cloud.storage.sidecar.proto.StatsResponse;
 import com.sun.management.OperatingSystemMXBean;
@@ -286,8 +287,13 @@ public final class WorkloadResult {
       long rustHwm = 0L;
       if (udsClient != null && udsClient.isPresent()) {
         try {
-          StatsResponse st = udsClient.get().getCoreStats(resetRustPeak);
-          rustCpu = st.getCpuUserSecs() + st.getCpuSysSecs();
+          UdsStorage uds = udsClient.get();
+          StatsResponse st = uds.getCoreStats(resetRustPeak);
+          // In INPROC mode, Tokio shares the JVM OS process so getProcessCpuTime() already covers
+          // both JVM and Rust threads; only add separate child-process CPU in SIDECAR mode.
+          if (uds.getDriverMode() == DriverMode.SIDECAR) {
+            rustCpu = st.getCpuUserSecs() + st.getCpuSysSecs();
+          }
           rustHwm = st.getPeakRssBytes();
         } catch (RuntimeException ignored) {
           // Supplementary diagnostic only.

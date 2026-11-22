@@ -111,6 +111,18 @@ public final class ClientProvider implements AutoCloseable {
       return new ClientProvider(config, Collections.<Storage>singletonList(uds), uds);
     }
 
+    if (config.driver() == BenchmarkConfig.DriverType.UDS_INPROC) {
+      StorageOptions baseOptions = buildBaseOptions(config.projectId(), config.protocol());
+      UdsStorage uds =
+          UdsStorage.newBuilder(baseOptions)
+              .setDriverMode(DriverMode.INPROC)
+              .setTransport(config.protocol())
+              .setInprocLibraryPath(config.inprocLibraryPath())
+              .setSocketPath(config.socketPath())
+              .build();
+      return new ClientProvider(config, Collections.<Storage>singletonList(uds), uds);
+    }
+
     throw new UnsupportedOperationException("Unsupported driver: " + config.driver());
   }
 

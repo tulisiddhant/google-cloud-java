@@ -19,5 +19,10 @@ package com.google.cloud.storage.sidecar;
 /** Deployment topology for hosting the Rust {@code gcscore.v1.GcsCore} UDS server. */
 public enum DriverMode {
   /** Spawns an external {@code gcs-core-server} child process bound to a local UDS path. */
-  SIDECAR
+  SIDECAR,
+  /**
+   * Hosts {@code gcscore.v1.GcsCore} in-process on a background Tokio runtime thread via JNA {@code
+   * gcs_core_start_inproc} / {@code gcs_core_stop_inproc} in {@code libstorage_grpc_uds.so}.
+   */
+  INPROC
 }
