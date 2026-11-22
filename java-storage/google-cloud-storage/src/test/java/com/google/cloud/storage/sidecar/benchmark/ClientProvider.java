@@ -58,6 +58,20 @@ public final class ClientProvider implements AutoCloseable {
     return new ClientProvider(config, Collections.singletonList(client), uds);
   }
 
+  /** Wraps an explicit client pool for hermetic multi-client workload unit tests. */
+  public static ClientProvider forClientPool(BenchmarkConfig config, List<Storage> pool) {
+    requireNonNull(config, "config");
+    requireNonNull(pool, "pool");
+    if (pool.isEmpty()) {
+      throw new IllegalArgumentException("pool must be non-empty");
+    }
+    UdsStorage uds =
+        (pool.size() == 1 && pool.get(0) instanceof UdsStorage)
+            ? (UdsStorage) pool.get(0)
+            : null;
+    return new ClientProvider(config, new ArrayList<Storage>(pool), uds);
+  }
+
   /** Instantiates and pre-warms the driver clients specified by {@code config}. */
   public static ClientProvider create(BenchmarkConfig config) throws IOException {
     requireNonNull(config, "config");
