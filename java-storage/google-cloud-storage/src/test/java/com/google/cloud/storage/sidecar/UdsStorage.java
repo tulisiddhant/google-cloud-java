@@ -22,6 +22,7 @@ import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
 import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.paging.Page;
+import com.google.cloud.PageImpl;
 import com.google.cloud.Policy;
 import com.google.cloud.ReadChannel;
 import com.google.cloud.RestorableState;
@@ -57,6 +58,12 @@ import com.google.cloud.storage.UdsPackageBridge;
 import com.google.cloud.storage.sidecar.proto.CloseObjectRequest;
 import com.google.cloud.storage.sidecar.proto.Empty;
 import com.google.cloud.storage.sidecar.proto.GcsCoreGrpc;
+import com.google.cloud.storage.sidecar.proto.ListBucketsRequest;
+import com.google.cloud.storage.sidecar.proto.ListBucketsResponse;
+import com.google.cloud.storage.sidecar.proto.ListObjectsRequest;
+import com.google.cloud.storage.sidecar.proto.ListObjectsResponse;
+import com.google.cloud.storage.sidecar.proto.ListedBucket;
+import com.google.cloud.storage.sidecar.proto.ListedObject;
 import com.google.cloud.storage.sidecar.proto.ObjectMeta;
 import com.google.cloud.storage.sidecar.proto.OpenObjectRequest;
 import com.google.cloud.storage.sidecar.proto.OpenObjectResponse;
@@ -85,6 +92,7 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
@@ -1242,12 +1250,129 @@ public final class UdsStorage implements Storage {
 
   @Override
   public Page<Blob> list(String bucket, BlobListOption... options) {
-    return unsupported("list(bucket, BlobListOption...) (implemented in Step 7 / WL7a)");
+    requireNonNull(bucket, "bucket");
+    ensureOpen();
+    if (this.transport != UdsTransport.GRPC) {
+      throw new UnsupportedOperationException(
+          "UdsStorage.list(bucket, BlobListOption...) is supported on GRPC transport only");
+    }
+    com.google.storage.v2.ListObjectsRequest v2Req =
+        UdsPackageBridge.extractListObjectsRequest(bucket, options);
+    ListObjectsRequest.Builder reqB =
+        ListObjectsRequest.newBuilder()
+            .setBucket(bucket)
+            .setPrefix(v2Req.getPrefix())
+            .setDelimiter(v2Req.getDelimiter())
+            .setStartOffset(v2Req.getLexicographicStart())
+            .setEndOffset(v2Req.getLexicographicEnd())
+            .setPageToken(v2Req.getPageToken())
+            .setPageSize(v2Req.getPageSize())
+            .setVersions(v2Req.getVersions());
+    return executeListObjectsPage(bucket, reqB.build());
+  }
+
+  private Page<Blob> executeListObjectsPage(final String bucket, final ListObjectsRequest req) {
+    final ListObjectsResponse resp;
+    try {
+      resp = blockingStub.withDeadlineAfter(60, TimeUnit.SECONDS).listObjects(req);
+    } catch (RuntimeException e) {
+      throw UdsPackageBridge.toStorageException(e);
+    }
+
+    List<ListedObject> items = resp.getItemsList();
+    List<String> prefixes = resp.getPrefixesList();
+    List<Blob> blobs = new ArrayList<Blob>(items.size() + prefixes.size());
+    for (int i = 0; i < items.size(); i++) {
+      ListedObject item = items.get(i);
+      blobs.add(
+          UdsPackageBridge.buildBlob(
+              this,
+              bucket,
+              item.getName(),
+              item.getGeneration(),
+              item.getSize(),
+              item.getMetageneration(),
+              item.getContentType(),
+              null,
+              item.getStorageClass(),
+              item.getUpdatedUnixSecs(),
+              item.getCrc32C()));
+    }
+    for (int i = 0; i < prefixes.size(); i++) {
+      blobs.add(UdsPackageBridge.buildSyntheticDirectoryBlob(this, bucket, prefixes.get(i)));
+    }
+
+    final String nextToken = resp.getNextPageToken().isEmpty() ? null : resp.getNextPageToken();
+    PageImpl.NextPageFetcher<Blob> fetcher =
+        new PageImpl.NextPageFetcher<Blob>() {
+          @Override
+          public Page<Blob> getNextPage() {
+            if (nextToken == null) {
+              return null;
+            }
+            return executeListObjectsPage(bucket, req.toBuilder().setPageToken(nextToken).build());
+          }
+        };
+    return new PageImpl<Blob>(fetcher, nextToken, blobs);
   }
 
   @Override
-  public Page<Bucket> list(BucketListOption... options) {
-    return unsupported("list(BucketListOption...) (implemented in Step 7 / WL7b)");
+  public Page<Bucket> list(BucketListOption... bucketOptions) {
+    ensureOpen();
+    if (this.transport != UdsTransport.GRPC) {
+      throw new UnsupportedOperationException(
+          "UdsStorage.list(BucketListOption...) is supported on GRPC transport only");
+    }
+    String projectId = this.options.getProjectId();
+    if (projectId == null || projectId.isEmpty()) {
+      throw new IllegalStateException("StorageOptions.projectId is required for listBuckets");
+    }
+    com.google.storage.v2.ListBucketsRequest v2Req =
+        UdsPackageBridge.extractListBucketsRequest(projectId, bucketOptions);
+    ListBucketsRequest req =
+        ListBucketsRequest.newBuilder()
+            .setProject(projectId)
+            .setPrefix(v2Req.getPrefix())
+            .setPageToken(v2Req.getPageToken())
+            .setPageSize(v2Req.getPageSize())
+            .build();
+    return executeListBucketsPage(req);
+  }
+
+  private Page<Bucket> executeListBucketsPage(final ListBucketsRequest req) {
+    final ListBucketsResponse resp;
+    try {
+      resp = blockingStub.withDeadlineAfter(60, TimeUnit.SECONDS).listBuckets(req);
+    } catch (RuntimeException e) {
+      throw UdsPackageBridge.toStorageException(e);
+    }
+
+    List<ListedBucket> items = resp.getItemsList();
+    List<Bucket> buckets = new ArrayList<Bucket>(items.size());
+    for (int i = 0; i < items.size(); i++) {
+      ListedBucket item = items.get(i);
+      buckets.add(
+          UdsPackageBridge.buildBucket(
+              this,
+              item.getName(),
+              item.getLocation(),
+              item.getStorageClass(),
+              item.getMetageneration(),
+              item.getCreatedUnixSecs()));
+    }
+
+    final String nextToken = resp.getNextPageToken().isEmpty() ? null : resp.getNextPageToken();
+    PageImpl.NextPageFetcher<Bucket> fetcher =
+        new PageImpl.NextPageFetcher<Bucket>() {
+          @Override
+          public Page<Bucket> getNextPage() {
+            if (nextToken == null) {
+              return null;
+            }
+            return executeListBucketsPage(req.toBuilder().setPageToken(nextToken).build());
+          }
+        };
+    return new PageImpl<Bucket>(fetcher, nextToken, buckets);
   }
 
   // ---------------------------------------------------------------------------
