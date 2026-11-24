@@ -102,7 +102,7 @@ public final class Wl3ReadConcurrentWorkload implements Workload {
         DEFAULT_RANGE_COUNT,
         DEFAULT_RANGE_BYTES,
         DEFAULT_STRIDE_BYTES,
-        DEFAULT_JSON_POOL_THREADS);
+        Integer.getInteger("wl3.json.threads", DEFAULT_JSON_POOL_THREADS));
   }
 
   public Wl3ReadConcurrentWorkload(
@@ -151,7 +151,8 @@ public final class Wl3ReadConcurrentWorkload implements Workload {
   }
 
   @Override
-  public WorkloadResult execute(ClientProvider clients, BenchmarkConfig config) throws Exception {
+  public WorkloadResult execute(final ClientProvider clients, BenchmarkConfig config)
+      throws Exception {
     if (!isApplicable(config.protocol(), config.bucketType())) {
       throw new IllegalArgumentException(
           "WL3 is N/A for protocol=" + config.protocol() + ", bucketType=" + config.bucketType());
@@ -159,7 +160,14 @@ public final class Wl3ReadConcurrentWorkload implements Workload {
 
     BlobId blobId = BlobId.of(config.bucketName(), OBJECT_NAME);
     boolean useGrpc = (config.protocol() == UdsTransport.GRPC);
-    String effectiveDisplayName = useGrpc ? DISPLAY_NAME_GRPC : DISPLAY_NAME_JSON;
+    String effectiveDisplayName =
+        useGrpc
+            ? DISPLAY_NAME_GRPC
+            : (jsonPoolThreads == DEFAULT_JSON_POOL_THREADS
+                ? DISPLAY_NAME_JSON
+                : "Read50x2x4 Concurrent (50 \u00d7 2 MiB Ranges Across "
+                    + jsonPoolThreads
+                    + "-Thread ReadChannel Pool)");
 
     ThreadPoolExecutor jsonExecutor = null;
     try {
@@ -179,6 +187,35 @@ public final class Wl3ReadConcurrentWorkload implements Workload {
       // 2. Timed steady-state loop (minPasses >= 20 AND elapsed >= 120s)
       WorkloadResult.ProcessSnapshot beforeSnap =
           WorkloadResult.ProcessSnapshot.capture(clients.udsClient(), true);
+      final AtomicInteger midTcp443 = new AtomicInteger(-1);
+      if (minDurationNs >= TimeUnit.SECONDS.toNanos(2)) {
+        Thread sampler =
+            new Thread(
+                new Runnable() {
+                  @Override
+                  public void run() {
+                    long[] delaysMs = new long[] {150L, 350L, 600L};
+                    int best = -1;
+                    for (int i = 0; i < delaysMs.length; i++) {
+                      try {
+                        Thread.sleep(delaysMs[i]);
+                      } catch (InterruptedException e) {
+                        return;
+                      }
+                      int cur =
+                          WorkloadResult.ProcessSnapshot.countEstablishedTcp443(
+                              clients.udsClient());
+                      if (cur > best) {
+                        best = cur;
+                      }
+                    }
+                    midTcp443.set(best);
+                  }
+                },
+                "wl3-tcp443-sampler");
+        sampler.setDaemon(true);
+        sampler.start();
+      }
       Instant wlStartUtc = Instant.now();
       long windowStartNs = System.nanoTime();
 
@@ -208,7 +245,7 @@ public final class Wl3ReadConcurrentWorkload implements Workload {
           wlEndUtc,
           Arrays.copyOf(latenciesNs, count),
           totalTimedBytes,
-          WorkloadResult.DiagnosticDelta.between(beforeSnap, afterSnap));
+          WorkloadResult.DiagnosticDelta.between(beforeSnap, afterSnap, midTcp443.get()));
     } finally {
       if (jsonExecutor != null) {
         jsonExecutor.shutdownNow();

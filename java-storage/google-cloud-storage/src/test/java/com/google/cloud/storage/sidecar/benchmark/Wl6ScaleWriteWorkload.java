@@ -237,7 +237,16 @@ public final class Wl6ScaleWriteWorkload implements Workload {
       deadlines.timedDeadlineNs = wlStartNs + durationNs;
       startTimedLatch.countDown();
 
-      timedDoneLatch.await();
+      int midTcp443 = -1;
+      long halfMs = TimeUnit.NANOSECONDS.toMillis(durationNs / 2);
+      if (halfMs >= 1000L) {
+        if (!timedDoneLatch.await(halfMs, TimeUnit.MILLISECONDS)) {
+          midTcp443 = WorkloadResult.ProcessSnapshot.countEstablishedTcp443(clients.udsClient());
+          timedDoneLatch.await();
+        }
+      } else {
+        timedDoneLatch.await();
+      }
       long wlEndNs = System.nanoTime();
       Instant wlEndUtc = Instant.now();
       WorkloadResult.ProcessSnapshot afterSnap =
@@ -261,7 +270,7 @@ public final class Wl6ScaleWriteWorkload implements Workload {
               mergedLatenciesNs,
               totalTimedBytes,
               wallActiveSec,
-              WorkloadResult.DiagnosticDelta.between(beforeSnap, afterSnap));
+              WorkloadResult.DiagnosticDelta.between(beforeSnap, afterSnap, midTcp443));
       return result;
     } catch (Throwable t) {
       abort.set(true);

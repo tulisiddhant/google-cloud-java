@@ -18,6 +18,7 @@ package com.google.cloud.storage.sidecar.benchmark;
 
 import static java.util.Objects.requireNonNull;
 
+import com.google.cloud.storage.GrpcStorageOptions;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
 import com.google.cloud.storage.sidecar.DriverMode;
@@ -105,6 +106,8 @@ public final class ClientProvider implements AutoCloseable {
           UdsStorage.newBuilder(baseOptions)
               .setDriverMode(DriverMode.SIDECAR)
               .setTransport(config.protocol())
+              .setGrpcSubchannels(config.grpcSubchannels())
+              .setUdsChannelCount(config.udsChannelCount())
               .setSidecarBinaryPath(config.sidecarBinaryPath())
               .setSocketPath(config.socketPath())
               .build();
@@ -117,6 +120,8 @@ public final class ClientProvider implements AutoCloseable {
           UdsStorage.newBuilder(baseOptions)
               .setDriverMode(DriverMode.INPROC)
               .setTransport(config.protocol())
+              .setGrpcSubchannels(config.grpcSubchannels())
+              .setUdsChannelCount(config.udsChannelCount())
               .setInprocLibraryPath(config.inprocLibraryPath())
               .setSocketPath(config.socketPath())
               .build();
@@ -128,10 +133,12 @@ public final class ClientProvider implements AutoCloseable {
 
   private static StorageOptions buildBaseOptions(String projectId, UdsTransport protocol) {
     if (protocol == UdsTransport.GRPC) {
-      return StorageOptions.grpc()
-          .setProjectId(projectId)
-          .setAttemptDirectPath(false)
-          .build();
+      GrpcStorageOptions.Builder b =
+          StorageOptions.grpc().setProjectId(projectId).setAttemptDirectPath(false);
+      if (Boolean.getBoolean("gcs.native.disable.grpc.metrics")) {
+        b.setEnableGrpcClientMetrics(false);
+      }
+      return b.build();
     }
     return StorageOptions.http().setProjectId(projectId).build();
   }

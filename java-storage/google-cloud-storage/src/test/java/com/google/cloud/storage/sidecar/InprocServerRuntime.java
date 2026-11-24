@@ -44,18 +44,26 @@ public final class InprocServerRuntime implements UdsServerRuntime {
   public interface GcsCoreNativeLibrary extends Library {
     int gcs_core_start_inproc(String socketPath);
 
+    int gcs_core_start_inproc_with_subchannels(String socketPath, int grpcSubchannels);
+
     int gcs_core_stop_inproc(String socketPath);
   }
 
   private final Path libraryPath;
   private final String socketPath;
+  private final int grpcSubchannels;
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private volatile GcsCoreNativeLibrary nativeLib;
   private volatile boolean running = false;
 
   public InprocServerRuntime(String libraryPath, String socketPath) {
+    this(libraryPath, socketPath, 0);
+  }
+
+  public InprocServerRuntime(String libraryPath, String socketPath, int grpcSubchannels) {
     this.libraryPath = Paths.get(requireNonNull(libraryPath, "libraryPath"));
     this.socketPath = requireNonNull(socketPath, "socketPath");
+    this.grpcSubchannels = Math.max(0, grpcSubchannels);
   }
 
   @Override
@@ -77,7 +85,10 @@ public final class InprocServerRuntime implements UdsServerRuntime {
     }
     this.nativeLib = lib;
 
-    int rc = lib.gcs_core_start_inproc(socketPath);
+    int rc =
+        grpcSubchannels > 0
+            ? lib.gcs_core_start_inproc_with_subchannels(socketPath, grpcSubchannels)
+            : lib.gcs_core_start_inproc(socketPath);
     if (rc != 0) {
       UdsServerRuntime.unlinkSocketFiles(socketPath);
       throw new IOException(

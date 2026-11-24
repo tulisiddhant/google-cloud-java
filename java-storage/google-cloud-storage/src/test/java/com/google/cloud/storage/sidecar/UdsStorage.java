@@ -81,6 +81,7 @@ import com.google.protobuf.ByteString;
 import io.grpc.Channel;
 import io.grpc.ClientInterceptors;
 import io.grpc.Context;
+import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
@@ -103,6 +104,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -120,30 +122,40 @@ public final class UdsStorage implements Storage {
   private final StorageOptions options;
   private final DriverMode driverMode;
   private final UdsTransport transport;
+  private final int grpcSubchannels;
   private final UdsServerRuntime serverRuntime;
   private final UdsChannelFactory.ChannelHandle channelHandle;
   private final GcsSessionManager sessionManager;
-  private final GcsCoreGrpc.GcsCoreBlockingStub blockingStub;
-  private final GcsCoreGrpc.GcsCoreStub asyncStub;
+  private final GcsCoreGrpc.GcsCoreBlockingStub[] blockingStubs;
+  private final GcsCoreGrpc.GcsCoreStub[] asyncStubs;
+  private final AtomicInteger stubRoundRobin = new AtomicInteger(0);
   private final AtomicBoolean closed = new AtomicBoolean(false);
 
   private UdsStorage(
       StorageOptions options,
       DriverMode driverMode,
       UdsTransport transport,
+      int grpcSubchannels,
       UdsServerRuntime serverRuntime,
       UdsChannelFactory.ChannelHandle channelHandle,
       GcsSessionManager sessionManager) {
     this.options = options;
     this.driverMode = driverMode;
     this.transport = transport;
+    this.grpcSubchannels = grpcSubchannels;
     this.serverRuntime = serverRuntime;
     this.channelHandle = channelHandle;
     this.sessionManager = sessionManager;
 
-    Channel intercepted = ClientInterceptors.intercept(channelHandle.channel(), sessionManager);
-    this.blockingStub = GcsCoreGrpc.newBlockingStub(intercepted);
-    this.asyncStub = GcsCoreGrpc.newStub(intercepted);
+    List<ManagedChannel> rawChannels = channelHandle.channels();
+    int n = rawChannels.size();
+    this.blockingStubs = new GcsCoreGrpc.GcsCoreBlockingStub[n];
+    this.asyncStubs = new GcsCoreGrpc.GcsCoreStub[n];
+    for (int i = 0; i < n; i++) {
+      Channel intercepted = ClientInterceptors.intercept(rawChannels.get(i), sessionManager);
+      this.blockingStubs[i] = GcsCoreGrpc.newBlockingStub(intercepted);
+      this.asyncStubs[i] = GcsCoreGrpc.newStub(intercepted);
+    }
   }
 
   public static Builder newBuilder(StorageOptions baseOptions) {
@@ -155,6 +167,8 @@ public final class UdsStorage implements Storage {
     private final StorageOptions baseOptions;
     private DriverMode driverMode = DriverMode.SIDECAR;
     private UdsTransport transport = UdsTransport.GRPC;
+    private int grpcSubchannels = Integer.getInteger("uds.grpc.subchannels", 0);
+    private int udsChannelCount = Integer.getInteger("uds.local.channels", 1);
     private String socketPath;
     private String sidecarBinaryPath;
     private String inprocLibraryPath;
@@ -172,6 +186,19 @@ public final class UdsStorage implements Storage {
 
     public Builder setTransport(UdsTransport transport) {
       this.transport = requireNonNull(transport, "transport");
+      return this;
+    }
+
+    public Builder setGrpcSubchannels(int grpcSubchannels) {
+      this.grpcSubchannels = Math.max(0, grpcSubchannels);
+      return this;
+    }
+
+    public Builder setUdsChannelCount(int udsChannelCount) {
+      if (udsChannelCount <= 0) {
+        throw new IllegalArgumentException("udsChannelCount must be > 0, got: " + udsChannelCount);
+      }
+      this.udsChannelCount = udsChannelCount;
       return this;
     }
 
@@ -214,8 +241,11 @@ public final class UdsStorage implements Storage {
       boolean ok = false;
       try {
         runtime.start();
-        chHandle = UdsChannelFactory.open(resolvedSocket);
-        UdsChannelFactory.awaitReady(chHandle.channel(), startupTimeoutMs, runtime);
+        chHandle = UdsChannelFactory.open(resolvedSocket, udsChannelCount);
+        List<ManagedChannel> allChannels = chHandle.channels();
+        for (int i = 0; i < allChannels.size(); i++) {
+          UdsChannelFactory.awaitReady(allChannels.get(i), startupTimeoutMs, runtime);
+        }
         sessMgr = GcsSessionManager.create(chHandle.channel(), baseOptions);
         if (runtime instanceof SidecarServerRuntime && !runtime.serverPid().isPresent()) {
           StatsResponse stats =
@@ -226,7 +256,8 @@ public final class UdsStorage implements Storage {
           ((SidecarServerRuntime) runtime).recordServerPid(stats.getPid());
         }
         UdsStorage instance =
-            new UdsStorage(baseOptions, driverMode, transport, runtime, chHandle, sessMgr);
+            new UdsStorage(
+                baseOptions, driverMode, transport, grpcSubchannels, runtime, chHandle, sessMgr);
         ok = true;
         return instance;
       } finally {
@@ -252,7 +283,7 @@ public final class UdsStorage implements Storage {
           throw new IllegalArgumentException(
               "sidecarBinaryPath must be set via Builder or -Duds.sidecar.bin for SIDECAR mode");
         }
-        return new SidecarServerRuntime(bin, resolvedSocket);
+        return new SidecarServerRuntime(bin, resolvedSocket, grpcSubchannels);
       }
       if (driverMode == DriverMode.INPROC) {
         String lib =
@@ -263,7 +294,7 @@ public final class UdsStorage implements Storage {
           throw new IllegalArgumentException(
               "inprocLibraryPath must be set via Builder or -Duds.inproc.lib for INPROC mode");
         }
-        return new InprocServerRuntime(lib, resolvedSocket);
+        return new InprocServerRuntime(lib, resolvedSocket, grpcSubchannels);
       }
       throw new UnsupportedOperationException("Unsupported DriverMode: " + driverMode);
     }
@@ -275,6 +306,14 @@ public final class UdsStorage implements Storage {
 
   public UdsTransport getTransport() {
     return transport;
+  }
+
+  public int getGrpcSubchannels() {
+    return grpcSubchannels;
+  }
+
+  public int getUdsChannelCount() {
+    return channelHandle.channelCount();
   }
 
   public String getSocketPath() {
@@ -291,17 +330,25 @@ public final class UdsStorage implements Storage {
 
   /** Queries {@code GcsCore.Stats} for supplementary Rust core CPU & VmHWM diagnostics. */
   public StatsResponse getCoreStats(boolean resetPeakRss) {
-    return blockingStub
+    return blockingStub()
         .withDeadlineAfter(10, TimeUnit.SECONDS)
         .stats(StatsRequest.newBuilder().setResetPeakRss(resetPeakRss).build());
   }
 
   GcsCoreGrpc.GcsCoreBlockingStub blockingStub() {
-    return blockingStub;
+    if (blockingStubs.length == 1) {
+      return blockingStubs[0];
+    }
+    int idx = (stubRoundRobin.getAndIncrement() & 0x7fffffff) % blockingStubs.length;
+    return blockingStubs[idx];
   }
 
   GcsCoreGrpc.GcsCoreStub asyncStub() {
-    return asyncStub;
+    if (asyncStubs.length == 1) {
+      return asyncStubs[0];
+    }
+    int idx = (stubRoundRobin.getAndIncrement() & 0x7fffffff) % asyncStubs.length;
+    return asyncStubs[idx];
   }
 
   @Override
@@ -359,7 +406,7 @@ public final class UdsStorage implements Storage {
     }
 
     final SettableApiFuture<BlobReadSession> future = SettableApiFuture.create();
-    asyncStub.openObject(
+    asyncStub().openObject(
         reqBuilder.build(),
         new ClientResponseObserver<OpenObjectRequest, OpenObjectResponse>() {
           @Override
@@ -476,7 +523,7 @@ public final class UdsStorage implements Storage {
         return future;
       }
 
-      asyncStub.readRange(
+      asyncStub().readRange(
           req,
           new ClientResponseObserver<ReadRangeRequest, ReadChunk>() {
             private byte[] buffer =
@@ -551,7 +598,7 @@ public final class UdsStorage implements Storage {
       }
       inflightReads.clear();
       try {
-        blockingStub
+        blockingStub()
             .withDeadlineAfter(30, TimeUnit.SECONDS)
             .closeObject(CloseObjectRequest.newBuilder().setHandle(handle).build());
       } catch (RuntimeException e) {
@@ -747,7 +794,7 @@ public final class UdsStorage implements Storage {
       streamCtx = Context.current().withCancellation();
       Context prev = streamCtx.attach();
       try {
-        chunkIterator = blockingStub.readObject(req);
+        chunkIterator = blockingStub().readObject(req);
       } finally {
         streamCtx.detach(prev);
       }
@@ -865,7 +912,7 @@ public final class UdsStorage implements Storage {
       this.targetBlobInfo = targetBlobInfo;
       this.resultFuture = resultFuture;
 
-      asyncStub.writeObject(
+      asyncStub().writeObject(
           new ClientResponseObserver<WriteRequest, WriteObjectResponse>() {
             @Override
             public void beforeStart(final ClientCallStreamObserver<WriteRequest> reqStream) {
@@ -1291,7 +1338,7 @@ public final class UdsStorage implements Storage {
   private Page<Blob> executeListObjectsPage(final String bucket, final ListObjectsRequest req) {
     final ListObjectsResponse resp;
     try {
-      resp = blockingStub.withDeadlineAfter(60, TimeUnit.SECONDS).listObjects(req);
+      resp = blockingStub().withDeadlineAfter(60, TimeUnit.SECONDS).listObjects(req);
     } catch (RuntimeException e) {
       throw UdsPackageBridge.toStorageException(e);
     }
@@ -1359,7 +1406,7 @@ public final class UdsStorage implements Storage {
   private Page<Bucket> executeListBucketsPage(final ListBucketsRequest req) {
     final ListBucketsResponse resp;
     try {
-      resp = blockingStub.withDeadlineAfter(60, TimeUnit.SECONDS).listBuckets(req);
+      resp = blockingStub().withDeadlineAfter(60, TimeUnit.SECONDS).listBuckets(req);
     } catch (RuntimeException e) {
       throw UdsPackageBridge.toStorageException(e);
     }

@@ -91,6 +91,8 @@ public final class BenchmarkConfig {
   private final String projectId;
   private final String bucketName;
   private final int nativePoolSize;
+  private final int grpcSubchannels;
+  private final int udsChannelCount;
   private final int quiescenceSec;
   private final String sidecarBinaryPath;
   private final String inprocLibraryPath;
@@ -108,6 +110,8 @@ public final class BenchmarkConfig {
             ? b.bucketName
             : (b.bucketType == BucketType.ZONAL ? DEFAULT_ZONAL_BUCKET : DEFAULT_REGIONAL_BUCKET);
     this.nativePoolSize = b.nativePoolSize;
+    this.grpcSubchannels = b.grpcSubchannels;
+    this.udsChannelCount = b.udsChannelCount;
     this.quiescenceSec = b.quiescenceSec;
     this.sidecarBinaryPath = b.sidecarBinaryPath;
     this.inprocLibraryPath = b.inprocLibraryPath;
@@ -121,6 +125,12 @@ public final class BenchmarkConfig {
     }
     if (this.nativePoolSize <= 0) {
       throw new IllegalArgumentException("nativePoolSize must be > 0");
+    }
+    if (this.grpcSubchannels < 0) {
+      throw new IllegalArgumentException("grpcSubchannels must be >= 0");
+    }
+    if (this.udsChannelCount <= 0) {
+      throw new IllegalArgumentException("udsChannelCount must be > 0");
     }
   }
 
@@ -160,6 +170,12 @@ public final class BenchmarkConfig {
           break;
         case "native-pool-size":
           b.setNativePoolSize(Integer.parseInt(val));
+          break;
+        case "grpc-subchannels":
+          b.setGrpcSubchannels(Integer.parseInt(val));
+          break;
+        case "uds-channels":
+          b.setUdsChannelCount(Integer.parseInt(val));
           break;
         case "quiescence-sec":
           b.setQuiescenceSec(Integer.parseInt(val));
@@ -212,6 +228,14 @@ public final class BenchmarkConfig {
     return nativePoolSize;
   }
 
+  public int grpcSubchannels() {
+    return grpcSubchannels;
+  }
+
+  public int udsChannelCount() {
+    return udsChannelCount;
+  }
+
   public int quiescenceSec() {
     return quiescenceSec;
   }
@@ -257,6 +281,8 @@ public final class BenchmarkConfig {
     private String bucketName;
     private int nativePoolSize =
         Integer.getInteger("gcs.native.channel.pool.size", DEFAULT_NATIVE_POOL_SIZE);
+    private int grpcSubchannels = Integer.getInteger("uds.grpc.subchannels", 0);
+    private int udsChannelCount = Integer.getInteger("uds.local.channels", 1);
     private int quiescenceSec = DEFAULT_QUIESCENCE_SEC;
     private String sidecarBinaryPath = System.getProperty("uds.sidecar.bin", "");
     private String inprocLibraryPath = System.getProperty("uds.inproc.lib", "");
@@ -293,6 +319,16 @@ public final class BenchmarkConfig {
 
     public Builder setNativePoolSize(int nativePoolSize) {
       this.nativePoolSize = nativePoolSize;
+      return this;
+    }
+
+    public Builder setGrpcSubchannels(int grpcSubchannels) {
+      this.grpcSubchannels = grpcSubchannels;
+      return this;
+    }
+
+    public Builder setUdsChannelCount(int udsChannelCount) {
+      this.udsChannelCount = udsChannelCount;
       return this;
     }
 

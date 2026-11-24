@@ -85,11 +85,15 @@ public final class BenchmarkSuiteRunner {
     BenchmarkConfig config = BenchmarkConfig.fromArgs(args);
     System.out.printf(
         Locale.US,
-        "[SUITE] Starting driver=%s protocol=%s bucketType=%s bucket=%s java=%s%n",
+        "[SUITE] Starting driver=%s protocol=%s bucketType=%s bucket=%s "
+            + "nativePool=%d grpcSubchannels=%d udsChannels=%d java=%s%n",
         config.driver().cliName(),
         config.protocol().name(),
         config.bucketType().cliName(),
         config.bucketName(),
+        config.nativePoolSize(),
+        config.grpcSubchannels(),
+        config.udsChannelCount(),
         System.getProperty("java.version"));
 
     try (ClientProvider clients = ClientProvider.create(config)) {
@@ -115,6 +119,9 @@ public final class BenchmarkSuiteRunner {
     suiteRecord.bucketType = config.bucketType().cliName();
     suiteRecord.projectId = config.projectId();
     suiteRecord.bucketName = config.bucketName();
+    suiteRecord.nativePoolSize = config.nativePoolSize();
+    suiteRecord.grpcSubchannels = config.grpcSubchannels();
+    suiteRecord.udsChannelCount = config.udsChannelCount();
     suiteRecord.javaVersion = System.getProperty("java.version", "unknown");
     suiteRecord.jvmName = System.getProperty("java.vm.name", "unknown");
     suiteRecord.suiteStartUtc = Instant.now().toString();
@@ -140,7 +147,7 @@ public final class BenchmarkSuiteRunner {
       System.out.printf(
           Locale.US,
           "[%s] Done: ops=%d activeSec=%.2fs P50=%.2fms P90=%.2fms P99=%.2fms "
-              + "MB/s=%.2f ops/s=%.2f%n",
+              + "MB/s=%.2f ops/s=%.2f tcp443=%d rxGbps=%.2f txGbps=%.2f%n",
           res.workloadId(),
           res.completedOps(),
           res.activeSec(),
@@ -148,7 +155,10 @@ public final class BenchmarkSuiteRunner {
           res.p90Ms(),
           res.p99Ms(),
           res.decimalMbPerSec(),
-          res.opsPerSec());
+          res.opsPerSec(),
+          rec.establishedTcp443,
+          rec.nicRxGbps,
+          rec.nicTxGbps);
     }
 
     suiteRecord.suiteEndUtc = Instant.now().toString();
@@ -175,6 +185,9 @@ public final class BenchmarkSuiteRunner {
     public String bucketType;
     public String projectId;
     public String bucketName;
+    public int nativePoolSize;
+    public int grpcSubchannels;
+    public int udsChannelCount;
     public String javaVersion;
     public String jvmName;
     public String suiteStartUtc;
@@ -202,6 +215,9 @@ public final class BenchmarkSuiteRunner {
     public double rustCpuCoresUsed;
     public long jvmPeakRssBytes;
     public long rustPeakRssBytes;
+    public int establishedTcp443;
+    public double nicRxGbps;
+    public double nicTxGbps;
 
     public static WorkloadRecord fromResult(WorkloadResult r) {
       WorkloadRecord rec = new WorkloadRecord();
@@ -225,6 +241,9 @@ public final class BenchmarkSuiteRunner {
         rec.rustCpuCoresUsed = d.rustCpuCoresUsed;
         rec.jvmPeakRssBytes = d.jvmPeakRssBytes;
         rec.rustPeakRssBytes = d.rustPeakRssBytes;
+        rec.establishedTcp443 = d.establishedTcp443;
+        rec.nicRxGbps = d.nicRxGbps;
+        rec.nicTxGbps = d.nicTxGbps;
       }
       return rec;
     }

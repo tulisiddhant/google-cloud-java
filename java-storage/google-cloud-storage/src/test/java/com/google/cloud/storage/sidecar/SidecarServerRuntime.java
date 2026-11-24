@@ -41,6 +41,7 @@ public final class SidecarServerRuntime implements UdsServerRuntime {
 
   private final Path binaryPath;
   private final String socketPath;
+  private final int grpcSubchannels;
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private final StringBuilder startupLogBuffer = new StringBuilder();
 
@@ -48,8 +49,13 @@ public final class SidecarServerRuntime implements UdsServerRuntime {
   private volatile long resolvedPid = -1L;
 
   public SidecarServerRuntime(String binaryPath, String socketPath) {
+    this(binaryPath, socketPath, 0);
+  }
+
+  public SidecarServerRuntime(String binaryPath, String socketPath, int grpcSubchannels) {
     this.binaryPath = Paths.get(requireNonNull(binaryPath, "binaryPath"));
     this.socketPath = requireNonNull(socketPath, "socketPath");
+    this.grpcSubchannels = Math.max(0, grpcSubchannels);
   }
 
   @Override
@@ -67,7 +73,7 @@ public final class SidecarServerRuntime implements UdsServerRuntime {
     cmd.add("--socket");
     cmd.add(socketPath);
     cmd.add("--grpc-subchannels");
-    cmd.add("0");
+    cmd.add(Integer.toString(grpcSubchannels));
     cmd.add("--chunk-size");
     cmd.add(Integer.toString(DEFAULT_CHUNK_SIZE_BYTES));
     cmd.add("--idle-secs");

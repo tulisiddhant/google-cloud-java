@@ -31,6 +31,9 @@ import io.grpc.netty.shaded.io.netty.channel.epoll.EpollEventLoopGroup;
 import io.grpc.netty.shaded.io.netty.channel.unix.DomainSocketAddress;
 import io.grpc.netty.shaded.io.netty.util.concurrent.DefaultThreadFactory;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -49,19 +52,30 @@ public final class UdsChannelFactory {
 
   private UdsChannelFactory() {}
 
-  /** Owns a {@link ManagedChannel} and its dedicated {@link EpollEventLoopGroup}. */
+  /** Owns one or more {@link ManagedChannel}s and their shared {@link EpollEventLoopGroup}. */
   public static final class ChannelHandle implements AutoCloseable {
-    private final ManagedChannel channel;
+    private final List<ManagedChannel> channels;
     private final EpollEventLoopGroup eventLoopGroup;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    ChannelHandle(ManagedChannel channel, EpollEventLoopGroup eventLoopGroup) {
-      this.channel = requireNonNull(channel, "channel");
+    ChannelHandle(List<ManagedChannel> channels, EpollEventLoopGroup eventLoopGroup) {
+      if (channels == null || channels.isEmpty()) {
+        throw new IllegalArgumentException("channels must be non-empty");
+      }
+      this.channels = Collections.unmodifiableList(new ArrayList<ManagedChannel>(channels));
       this.eventLoopGroup = requireNonNull(eventLoopGroup, "eventLoopGroup");
     }
 
     public ManagedChannel channel() {
-      return channel;
+      return channels.get(0);
+    }
+
+    public List<ManagedChannel> channels() {
+      return channels;
+    }
+
+    public int channelCount() {
+      return channels.size();
     }
 
     @Override
@@ -69,14 +83,21 @@ public final class UdsChannelFactory {
       if (!closed.compareAndSet(false, true)) {
         return;
       }
-      channel.shutdown();
+      for (int i = 0; i < channels.size(); i++) {
+        channels.get(i).shutdown();
+      }
       try {
-        if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
-          channel.shutdownNow();
-          channel.awaitTermination(2, TimeUnit.SECONDS);
+        for (int i = 0; i < channels.size(); i++) {
+          ManagedChannel ch = channels.get(i);
+          if (!ch.awaitTermination(5, TimeUnit.SECONDS)) {
+            ch.shutdownNow();
+            ch.awaitTermination(2, TimeUnit.SECONDS);
+          }
         }
       } catch (InterruptedException e) {
-        channel.shutdownNow();
+        for (int i = 0; i < channels.size(); i++) {
+          channels.get(i).shutdownNow();
+        }
         Thread.currentThread().interrupt();
       } finally {
         eventLoopGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS);
@@ -86,31 +107,50 @@ public final class UdsChannelFactory {
 
   /** Creates a tuned {@code AF_UNIX} {@link ChannelHandle} connected to {@code socketPath}. */
   public static ChannelHandle open(String socketPath) throws IOException {
+    return open(socketPath, Integer.getInteger("uds.local.channels", 1));
+  }
+
+  /**
+   * Creates a tuned pool of {@code channelCount} {@code AF_UNIX} {@link ManagedChannel}s connected
+   * to {@code socketPath}, sizing the {@link EpollEventLoopGroup} so every channel can bind to its
+   * own Netty event-loop thread.
+   */
+  public static ChannelHandle open(String socketPath, int channelCount) throws IOException {
     requireNonNull(socketPath, "socketPath");
+    if (channelCount <= 0) {
+      throw new IllegalArgumentException("channelCount must be > 0, got: " + channelCount);
+    }
     if (!Epoll.isAvailable()) {
       throw new IOException("Linux Netty Epoll transport is unavailable", Epoll.unavailabilityCause());
     }
+    int threads = Math.max(EVENT_LOOP_THREADS, channelCount);
     EpollEventLoopGroup group =
-        new EpollEventLoopGroup(
-            EVENT_LOOP_THREADS, new DefaultThreadFactory("gcs-uds-epoll", true));
+        new EpollEventLoopGroup(threads, new DefaultThreadFactory("gcs-uds-epoll", true));
+    List<ManagedChannel> created = new ArrayList<ManagedChannel>(channelCount);
     boolean ok = false;
     try {
-      ManagedChannel channel =
-          NettyChannelBuilder.forAddress(new DomainSocketAddress(socketPath))
-              .overrideAuthority("localhost")
-              .channelType(EpollDomainSocketChannel.class)
-              .eventLoopGroup(group)
-              .withOption(ChannelOption.SO_RCVBUF, SOCKET_BUFFER_BYTES)
-              .withOption(ChannelOption.SO_SNDBUF, SOCKET_BUFFER_BYTES)
-              .initialFlowControlWindow(FLOW_CONTROL_WINDOW_BYTES)
-              .maxInboundMessageSize(MAX_INBOUND_MESSAGE_BYTES)
-              .directExecutor()
-              .usePlaintext()
-              .build();
+      for (int i = 0; i < channelCount; i++) {
+        ManagedChannel channel =
+            NettyChannelBuilder.forAddress(new DomainSocketAddress(socketPath))
+                .overrideAuthority("localhost")
+                .channelType(EpollDomainSocketChannel.class)
+                .eventLoopGroup(group)
+                .withOption(ChannelOption.SO_RCVBUF, SOCKET_BUFFER_BYTES)
+                .withOption(ChannelOption.SO_SNDBUF, SOCKET_BUFFER_BYTES)
+                .initialFlowControlWindow(FLOW_CONTROL_WINDOW_BYTES)
+                .maxInboundMessageSize(MAX_INBOUND_MESSAGE_BYTES)
+                .directExecutor()
+                .usePlaintext()
+                .build();
+        created.add(channel);
+      }
       ok = true;
-      return new ChannelHandle(channel, group);
+      return new ChannelHandle(created, group);
     } finally {
       if (!ok) {
+        for (int i = 0; i < created.size(); i++) {
+          created.get(i).shutdownNow();
+        }
         group.shutdownGracefully(0, 1, TimeUnit.SECONDS);
       }
     }

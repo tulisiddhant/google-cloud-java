@@ -57,6 +57,24 @@ public class UdsInprocTest {
   }
 
   @Test
+  public void benchmarkConfigParsesSymmetryChannelFlags() {
+    BenchmarkConfig cfg =
+        BenchmarkConfig.fromArgs(
+            new String[] {
+              "--driver=uds-inproc",
+              "--protocol=GRPC",
+              "--bucket-type=regional",
+              "--native-pool-size=48",
+              "--grpc-subchannels=48",
+              "--uds-channels=16",
+              "--inproc-lib=/tmp/libstorage_grpc_uds.so"
+            });
+    assertThat(cfg.nativePoolSize()).isEqualTo(48);
+    assertThat(cfg.grpcSubchannels()).isEqualTo(48);
+    assertThat(cfg.udsChannelCount()).isEqualTo(16);
+  }
+
+  @Test
   public void liveInprocLibraryStartsInSamePidAnswersPingSessionStatsAndStopsCleanlyTwice()
       throws Exception {
     String libPath = System.getProperty("uds.inproc.lib", "");
@@ -116,6 +134,57 @@ public class UdsInprocTest {
 
       assertThat(Files.exists(Paths.get(sockPath))).isFalse();
       assertThat(Files.exists(Paths.get(sockPath + ".shm"))).isFalse();
+    }
+  }
+
+  @Test
+  public void pooledUdsChannelsAndSubchannelsRoundRobinAcrossInprocAndSidecar() throws Exception {
+    String libPath = System.getProperty("uds.inproc.lib", "");
+    String binPath = System.getProperty("uds.sidecar.bin", "");
+    Assume.assumeFalse(
+        "Pass -Duds.inproc.lib and -Duds.sidecar.bin to run pooled channel test",
+        libPath.isEmpty() || binPath.isEmpty());
+    Assume.assumeTrue("libstorage_grpc_uds.so must exist", Files.isRegularFile(Paths.get(libPath)));
+    Assume.assumeTrue("gcs-core-server must exist", Files.isRegularFile(Paths.get(binPath)));
+
+    OAuth2Credentials creds =
+        new OAuth2Credentials() {
+          @Override
+          public AccessToken refreshAccessToken() {
+            return new AccessToken("sym-token", new Date(System.currentTimeMillis() + 3600_000L));
+          }
+        };
+    StorageOptions opts =
+        StorageOptions.grpc()
+            .setProjectId("vaibhavpratap-sdk-test")
+            .setCredentials(creds)
+            .setAttemptDirectPath(false)
+            .build();
+
+    DriverMode[] modes = new DriverMode[] {DriverMode.SIDECAR, DriverMode.INPROC};
+    for (int m = 0; m < modes.length; m++) {
+      DriverMode mode = modes[m];
+      String sockPath;
+      try (UdsStorage uds =
+          UdsStorage.newBuilder(opts)
+              .setDriverMode(mode)
+              .setTransport(UdsTransport.GRPC)
+              .setGrpcSubchannels(8)
+              .setUdsChannelCount(4)
+              .setSidecarBinaryPath(binPath)
+              .setInprocLibraryPath(libPath)
+              .build()) {
+        sockPath = uds.getSocketPath();
+        assertThat(uds.getGrpcSubchannels()).isEqualTo(8);
+        assertThat(uds.getUdsChannelCount()).isEqualTo(4);
+        for (int i = 0; i < 20; i++) {
+          ByteString payload = ByteString.copyFromUtf8("pooled-ping-" + mode + "-" + i);
+          PingResponse resp =
+              uds.blockingStub().ping(PingRequest.newBuilder().setPayload(payload).build());
+          assertThat(resp.getPayload()).isEqualTo(payload);
+        }
+      }
+      assertThat(Files.exists(Paths.get(sockPath))).isFalse();
     }
   }
 }
